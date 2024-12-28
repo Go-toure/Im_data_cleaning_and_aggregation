@@ -5,8 +5,9 @@ library(lubridate)
 library(tidyjson)
 library(rjson)
 
+DF <- read_rds("IMDRC.rds")
 # DF <- read_csv("IM_DRC.json")
-DF <- read_csv("COG_SIA_H1.csv")
+# DF <- read_csv("COG_SIA_H1.csv")
  # DF$Country[is.na(DF$Country)] <- "CIV"
 # DF$Country[DF$Country == "NA"] <- "CIV"
 # mydata <- fromJSON(file="IM_DRC.json")
@@ -181,7 +182,9 @@ GF$`HH[10]/Parent_Caregive_Inform_HH`[GF$`HH[10]/Parent_Caregive_Inform_HH` == "
 GG <- GF |>
   # replace(is.na("."), "0") |> 
   mutate(across((starts_with("HH[")),
-                as.numeric))
+                as.numeric)) |> 
+  mutate_at(c(8:13), as.numeric)
+
 GH <- GG |>
   mutate(
     u5_present = rowSums(across(
