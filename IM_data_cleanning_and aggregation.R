@@ -4,10 +4,11 @@ library(tidyverse)
 library(lubridate)
 library(tidyjson)
 library(rjson)
-
-DF <- read_rds("IMDRC.rds")
+library(readr)
+library(readxl)
+# DF <- read_rds("IMDRC.rds")
 # DF <- read_csv("IM_DRC.json")
-# DF <- read_csv("COG_SIA_H1.csv")
+DF <- read_excel("CHD_SIA_HM.xlsx")
  # DF$Country[is.na(DF$Country)] <- "CIV"
 # DF$Country[DF$Country == "NA"] <- "CIV"
 # mydata <- fromJSON(file="IM_DRC.json")
