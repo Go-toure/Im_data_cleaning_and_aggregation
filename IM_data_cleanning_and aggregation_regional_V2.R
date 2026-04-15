@@ -1,0 +1,969 @@
+# ============================================================
+# Regional IM data cleaning and aggregation
+# Updated generic version for AFRO countries
+# ============================================================
+
+# ---- Load required packages ----
+pacman::p_load(
+  tidyverse, lubridate, readxl, readr, tools, tibble, qs, stringr
+)
+
+# ============================================================
+# Input / Output paths
+# ============================================================
+input_file <- "C:/Users/TOURE/Documents/PADACORD/IM/4445.rds"
+output_folder <- "C:/Users/TOURE/Documents/PADACORD/IM_c/"
+qc_output_folder <- "C:/Users/TOURE/Documents/PADACORD/IM_c/QC/"
+
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+if (!dir.exists(qc_output_folder)) dir.create(qc_output_folder, recursive = TRUE)
+
+file_name <- tools::file_path_sans_ext(basename(input_file))
+output_file <- file.path(output_folder, paste0(file_name, ".csv"))
+qc_output_file <- file.path(qc_output_folder, paste0(file_name, "_QC.csv"))
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+parse_mixed_dates <- function(x) {
+  x <- as.character(x)
+  suppressWarnings(
+    dplyr::coalesce(
+      ymd(x),
+      dmy(x),
+      mdy(x),
+      ymd_hms(x),
+      dmy_hms(x),
+      mdy_hms(x)
+    )
+  )
+}
+
+clean_numeric <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[x %in% c("", " ", "n/a", "NA", "NaN", "null", "NULL")] <- "0"
+  suppressWarnings(as.numeric(x))
+}
+
+clean_yes_no_numeric <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  dplyr::case_when(
+    x %in% c("Y", "YES", "Yes", "yes", "1") ~ 1,
+    x %in% c("N", "NO", "No", "no", "0") ~ 0,
+    x %in% c("", " ", "n/a", "NA", "NaN", "null", "NULL") ~ 0,
+    TRUE ~ suppressWarnings(as.numeric(x))
+  )
+}
+
+safe_row_sum <- function(df, cols) {
+  cols <- intersect(cols, names(df))
+  if (length(cols) == 0) return(rep(0, nrow(df)))
+  temp <- df[, cols, drop = FALSE]
+  temp[] <- lapply(temp, function(x) suppressWarnings(as.numeric(as.character(x))))
+  rowSums(temp, na.rm = TRUE)
+}
+
+safe_pick_first <- function(df, candidates, default = 0) {
+  candidates <- intersect(candidates, names(df))
+  if (length(candidates) == 0) return(rep(default, nrow(df)))
+  suppressWarnings(as.numeric(as.character(df[[candidates[1]]])))
+}
+
+find_similar_column <- function(target_pattern, df, exact_first = TRUE) {
+  cols <- names(df)
+  
+  if (exact_first && target_pattern %in% cols) {
+    return(target_pattern)
+  }
+  
+  patterns <- c(
+    target_pattern,
+    gsub("\\[|\\]|/", "_", target_pattern),
+    gsub(".*/", "", target_pattern),
+    gsub("\\[|\\]", "", target_pattern),
+    tolower(target_pattern),
+    gsub("_", "", target_pattern)
+  )
+  
+  for (pattern in patterns) {
+    matches <- cols[grepl(pattern, cols, ignore.case = TRUE)]
+    if (length(matches) > 0) return(matches[1])
+  }
+  
+  return(NA_character_)
+}
+
+rename_repetitive_columns <- function(data) {
+  pattern <- "^HH\\[\\d+\\]/HH/"
+  new_columns <- sapply(colnames(data), function(col) {
+    if (grepl(pattern, col)) {
+      gsub("HH/", "", col)
+    } else {
+      col
+    }
+  })
+  colnames(data) <- new_columns
+  data
+}
+
+# ============================================================
+# Read data
+# ============================================================
+data <- qread(input_file) %>% as_tibble()
+
+# ============================================================
+# Country-specific transformations
+# ============================================================
+apply_country_specific_transformations <- function(data, file_name) {
+  if (startsWith(file_name, "3583")) {
+    data <- data %>% mutate(Country = "GHA")
+  }
+  
+  if (startsWith(file_name, "8834")) {
+    data <- data %>% mutate(Region = District)
+  }
+  
+  if (startsWith(file_name, "4351")) {
+    if ("district" %in% names(data)) {
+      data <- data %>% mutate(District = district)
+    }
+  }
+  
+  data
+}
+
+data <- apply_country_specific_transformations(data, file_name)
+data <- rename_repetitive_columns(data)
+
+# ============================================================
+# Standard columns and HH patterns
+# ============================================================
+required_columns <- c(
+  "Country", "Region", "District", "Response", "roundNumber",
+  "Type_Monitoring", "date_monitored", "HH_count", "Total_U5_Present",
+  "TotalFM", "sum_missed_children", "Total_Absent", "Total_refusal"
+)
+
+hh_patterns <- c(
+  "Total_U5_Present_HH", "U5_Vac_FM_HH", "Tot_child_Absent_HH",
+  "Tot_child_NC_HH", "Tot_child_NotVisited_HH", "Tot_child_NotRevisited",
+  "Tot_child_Asleep_HH", "Tot_child_VaccinatedRoutine", "Tot_child_Others_HH",
+  "Parent_Caregive_Inform_HH",
+  # Algeria variants
+  "Total_U6_Present_HH", "U6_Vac_FM_HH"
+)
+
+# Detailed absence totals
+absence_total_candidates <- list(
+  r_abs_play_areas    = c("Tot_child_Abs_Play_areas_T"),
+  r_abs_market        = c("Tot_child_Abs_Market_T"),
+  r_abs_school        = c("Tot_child_Abs_School_T"),
+  r_abs_farm          = c("Tot_child_Abs_Farm_T"),
+  r_abs_social_event  = c("Tot_child_Abs_SocialEvent"),
+  r_abs_travelling    = c("Sum_child_Abs_Travelling"),
+  r_abs_parent_absent = c("Sum_child_Abs_Parent_Absent"),
+  r_abs_other_detail  = c("Tot_child_Abs_Other_T")
+)
+
+# Detailed NC totals
+nc_total_candidates <- list(
+  r_nc_religious_beliefs = c("Tot_child_NC_Religious_beliefs_T"),
+  r_nc_side_effects      = c("Tot_child_NC_sideEffects"),
+  r_nc_too_many_doses    = c("Sum_Too_many_doses"),
+  r_nc_child_sick        = c("Sum_Child_sick", "Tot_child_NC_ChildSick_T"),
+  r_nc_covid             = c("Sum_NC_COVID"),
+  r_nc_other_detail      = c("Sum_NC_Others", "Tot_child_NC_Others_T")
+)
+
+# Algeria HH-level detailed absence
+algeria_abs_hh_patterns <- list(
+  r_abs_sick_hh       = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Sick$",
+  r_abs_school_hh     = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_School$",
+  r_abs_play_hh       = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Play_areas$",
+  r_abs_social_hh     = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Social_event$",
+  r_abs_travel_hh     = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Travelling$",
+  r_abs_other_hh      = "^HH\\[[0-9]+\\]/group2/Other_Reason_Absent$"
+)
+
+# Algeria HH-level detailed NC
+algeria_nc_hh_patterns <- list(
+  r_nc_child_sick_hh  = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_Child_was_sick$",
+  r_nc_not_decided_hh = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_pas_decide$",
+  r_nc_polio_free_hh  = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_PolioFree$",
+  r_nc_nopv_hh        = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_nOPV$",
+  r_nc_other_hh       = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_Other$"
+)
+
+# ============================================================
+# Dynamic column selection
+# ============================================================
+select_columns_dynamically <- function(df, required_cols, hh_patterns, hh_count = 10) {
+  selected_cols <- c()
+  
+  for (col in required_cols) {
+    matched_col <- find_similar_column(col, df)
+    if (!is.na(matched_col)) {
+      selected_cols <- c(selected_cols, matched_col)
+    } else {
+      message("Warning: Could not find column matching pattern: ", col)
+    }
+  }
+  
+  for (hh_num in 1:hh_count) {
+    for (pattern in hh_patterns) {
+      possible_patterns <- c(
+        paste0("HH\\[", hh_num, "\\]/", pattern),
+        paste0("HH\\[", hh_num, "\\]/group1/", pattern),
+        paste0("HH\\[", hh_num, "\\]/group2/", pattern),
+        paste0("HH\\[", hh_num, "\\]/group4/", pattern),
+        paste0("HH_", hh_num, "_", pattern),
+        paste0("HH", hh_num, "_", pattern)
+      )
+      
+      for (hh_pattern in possible_patterns) {
+        matched_col <- find_similar_column(hh_pattern, df, exact_first = FALSE)
+        if (!is.na(matched_col)) {
+          selected_cols <- c(selected_cols, matched_col)
+          break
+        }
+      }
+    }
+  }
+  
+  # Add detailed totals if present
+  detailed_cols <- unique(c(
+    unlist(absence_total_candidates),
+    unlist(nc_total_candidates),
+    "Tot_child_NC_NotDecide_T",
+    "Tot_child_NC_PolioFREE_T",
+    "Tot_child_NC_nOPV_T",
+    "Tot_child_NC_ChildSick_T",
+    "Tot_child_NC_Others_T",
+    "Tot_child_Abs_Sick_T"
+  ))
+  
+  selected_cols <- unique(c(selected_cols, intersect(detailed_cols, names(df))))
+  
+  # Add Algeria HH-level detailed columns if present
+  for (p in c(
+    unlist(algeria_abs_hh_patterns),
+    unlist(algeria_nc_hh_patterns)
+  )) {
+    selected_cols <- unique(c(selected_cols, grep(p, names(df), value = TRUE)))
+  }
+  
+  unique(selected_cols)
+}
+
+columns_to_select <- select_columns_dynamically(data, required_columns, hh_patterns)
+message("Selected ", length(columns_to_select), " columns for processing")
+
+# ============================================================
+# Safe filtering
+# ============================================================
+safe_filter_data <- function(df) {
+  result <- df
+  
+  if ("Type_Monitoring" %in% names(result)) {
+    result <- result %>% filter(Type_Monitoring == "EndProcess")
+  }
+  
+  if ("Response" %in% names(result)) {
+    result <- result %>%
+      filter(!is.na(Response), Response != "", Response != "n/a", Response != "NA")
+  }
+  
+  if ("roundNumber" %in% names(result)) {
+    result <- result %>%
+      filter(!is.na(roundNumber), roundNumber != "", roundNumber != "n/a", roundNumber != "NA")
+  }
+  
+  if ("Total_U5_Present" %in% names(result)) {
+    result <- result %>% filter(is.na(Total_U5_Present) | Total_U5_Present != "n/a")
+  }
+  
+  if ("TotalFM" %in% names(result)) {
+    result <- result %>% filter(!is.na(TotalFM))
+  }
+  
+  result
+}
+
+GF <- data %>%
+  safe_filter_data() %>%
+  select(any_of(columns_to_select))
+
+if (nrow(GF) == 0) {
+  message("Warning: No data after filtering. Using original data with selected columns.")
+  GF <- data %>% select(any_of(columns_to_select))
+}
+
+message("Data after filtering: ", nrow(GF), " rows")
+
+# ============================================================
+# Clean HH and numeric columns
+# ============================================================
+hh_cols <- names(GF)[str_detect(names(GF), "^HH\\[")]
+
+for (col in hh_cols) {
+  if (str_detect(col, "Parent_Caregive_Inform_HH")) {
+    GF[[col]] <- clean_yes_no_numeric(GF[[col]])
+  } else {
+    GF[[col]] <- clean_numeric(GF[[col]])
+  }
+}
+
+numeric_cols <- intersect(
+  c(
+    "HH_count", "Total_U5_Present", "TotalFM", "sum_missed_children",
+    "Total_Absent", "Total_refusal",
+    unlist(absence_total_candidates),
+    unlist(nc_total_candidates),
+    "Tot_child_NC_NotDecide_T", "Tot_child_NC_PolioFREE_T",
+    "Tot_child_NC_nOPV_T", "Tot_child_NC_ChildSick_T",
+    "Tot_child_NC_Others_T", "Tot_child_Abs_Sick_T"
+  ),
+  names(GF)
+)
+
+if (length(numeric_cols) > 0) {
+  GF[numeric_cols] <- lapply(GF[numeric_cols], clean_numeric)
+}
+
+if ("date_monitored" %in% names(GF)) {
+  GF <- GF %>% mutate(date_monitored = parse_mixed_dates(date_monitored))
+}
+
+# ============================================================
+# Build summary columns dynamically
+# ============================================================
+get_regex_cols <- function(df, pattern) {
+  grep(pattern, names(df), value = TRUE)
+}
+
+create_summary_columns <- function(df) {
+  # Main present / vaccinated columns
+  present_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Total_U5_Present_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Total_U6_Present_HH$")
+  ))
+  
+  fm_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/U5_Vac_FM_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/U6_Vac_FM_HH$")
+  ))
+  
+  # Main top-level reasons
+  abs_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_Absent_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_Absent_HH$")
+  ))
+  
+  nc_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_NC_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_NC_HH$")
+  ))
+  
+  notvisited_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_NotVisited_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_NotVisited_HH$")
+  ))
+  
+  notrevisited_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_NotRevisited$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_NotRevisited$")
+  ))
+  
+  asleep_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_Asleep_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_Asleep_HH$")
+  ))
+  
+  routine_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_VaccinatedRoutine$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_VaccinatedRoutine$")
+  ))
+  
+  other_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_Others_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_Others_HH$")
+  ))
+  
+  caregiver_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Parent_Caregive_Inform_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Parent_Caregive_Inform_HH$")
+  ))
+  
+  # Algeria HH-level absence detail
+  abs_sick_hh_cols   <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_sick_hh)
+  abs_school_hh_cols <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_school_hh)
+  abs_play_hh_cols   <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_play_hh)
+  abs_social_hh_cols <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_social_hh)
+  abs_travel_hh_cols <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_travel_hh)
+  abs_other_hh_cols  <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_other_hh)
+  
+  # Algeria HH-level NC detail
+  nc_childsick_hh_cols <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_child_sick_hh)
+  nc_notdecide_hh_cols <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_not_decided_hh)
+  nc_poliofree_hh_cols <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_polio_free_hh)
+  nc_nopv_hh_cols      <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_nopv_hh)
+  nc_other_hh_cols     <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_other_hh)
+  
+  df %>%
+    mutate(
+      u5_present = safe_row_sum(., present_cols),
+      u5_FM1 = safe_row_sum(., fm_cols),
+      u5_FM = ifelse(u5_FM1 > u5_present & u5_present > 0, u5_present, u5_FM1),
+      u5_FM = ifelse(is.na(u5_FM), 0, u5_FM),
+      missed_child = pmax(0, u5_present - u5_FM),
+      
+      # Top-level reasons
+      r_non_FM_Absent = safe_row_sum(., abs_cols),
+      r_non_FM_NC = safe_row_sum(., nc_cols),
+      r_non_FM_hh_notvisited = safe_row_sum(., notvisited_cols),
+      r_non_FM_hh_notrevisited = safe_row_sum(., notrevisited_cols),
+      r_non_FM_sleep = safe_row_sum(., asleep_cols),
+      r_non_FM_vaccinatedRoutine = safe_row_sum(., routine_cols),
+      r_non_FM_other = safe_row_sum(., other_cols),
+      care_Giver_Informed_SIA = safe_row_sum(., caregiver_cols),
+      
+      # Detailed absence totals
+      r_abs_play_areas = safe_pick_first(., absence_total_candidates$r_abs_play_areas),
+      r_abs_market = safe_pick_first(., absence_total_candidates$r_abs_market),
+      r_abs_school = safe_pick_first(., absence_total_candidates$r_abs_school),
+      r_abs_farm = safe_pick_first(., absence_total_candidates$r_abs_farm),
+      r_abs_social_event = safe_pick_first(., absence_total_candidates$r_abs_social_event),
+      r_abs_travelling = safe_pick_first(., absence_total_candidates$r_abs_travelling),
+      r_abs_parent_absent = safe_pick_first(., absence_total_candidates$r_abs_parent_absent),
+      r_abs_other_detail_form = safe_pick_first(., absence_total_candidates$r_abs_other_detail),
+      
+      # Algeria HH-level absence details
+      r_abs_sick = safe_row_sum(., abs_sick_hh_cols),
+      r_abs_school_hh = safe_row_sum(., abs_school_hh_cols),
+      r_abs_play_hh = safe_row_sum(., abs_play_hh_cols),
+      r_abs_social_hh = safe_row_sum(., abs_social_hh_cols),
+      r_abs_travel_hh = safe_row_sum(., abs_travel_hh_cols),
+      r_abs_other_hh = safe_row_sum(., abs_other_hh_cols),
+      
+      # Detailed NC totals
+      r_nc_religious_beliefs = safe_pick_first(., nc_total_candidates$r_nc_religious_beliefs),
+      r_nc_side_effects = safe_pick_first(., nc_total_candidates$r_nc_side_effects),
+      r_nc_too_many_doses = safe_pick_first(., nc_total_candidates$r_nc_too_many_doses),
+      r_nc_child_sick_form = safe_pick_first(., nc_total_candidates$r_nc_child_sick),
+      r_nc_covid = safe_pick_first(., nc_total_candidates$r_nc_covid),
+      r_nc_other_detail_form = safe_pick_first(., nc_total_candidates$r_nc_other_detail),
+      
+      # Algeria HH-level NC details
+      r_nc_child_sick_hh = safe_row_sum(., nc_childsick_hh_cols),
+      r_nc_not_decided = safe_row_sum(., nc_notdecide_hh_cols),
+      r_nc_polio_free = safe_row_sum(., nc_poliofree_hh_cols),
+      r_nc_nopv = safe_row_sum(., nc_nopv_hh_cols),
+      r_nc_other_hh = safe_row_sum(., nc_other_hh_cols)
+    ) %>%
+    mutate(
+      r_abs_other_detail = pmax(r_abs_other_detail_form, r_abs_other_hh, na.rm = TRUE),
+      r_abs_school = pmax(r_abs_school, r_abs_school_hh, na.rm = TRUE),
+      r_abs_play_areas = pmax(r_abs_play_areas, r_abs_play_hh, na.rm = TRUE),
+      r_abs_social_event = pmax(r_abs_social_event, r_abs_social_hh, na.rm = TRUE),
+      r_abs_travelling = pmax(r_abs_travelling, r_abs_travel_hh, na.rm = TRUE),
+      
+      r_nc_child_sick = pmax(r_nc_child_sick_form, r_nc_child_sick_hh, na.rm = TRUE),
+      r_nc_other_detail = pmax(r_nc_other_detail_form, r_nc_other_hh, na.rm = TRUE),
+      
+      abs_detail_total =
+        r_abs_sick + r_abs_play_areas + r_abs_market + r_abs_school +
+        r_abs_farm + r_abs_social_event + r_abs_travelling +
+        r_abs_parent_absent + r_abs_other_detail,
+      
+      nc_detail_total =
+        r_nc_religious_beliefs + r_nc_side_effects + r_nc_too_many_doses +
+        r_nc_child_sick + r_nc_covid + r_nc_other_detail +
+        r_nc_not_decided + r_nc_polio_free + r_nc_nopv
+    )
+}
+
+GG <- GF
+GH <- create_summary_columns(GG)
+
+# Ensure Number_of_HH_visited exists
+GH <- GH %>%
+  mutate(
+    Number_of_HH_visited = case_when(
+      "HH_count" %in% names(.) ~ as.numeric(HH_count),
+      "Number_of_HH_visited" %in% names(.) ~ as.numeric(Number_of_HH_visited),
+      TRUE ~ NA_real_
+    )
+  )
+
+# ============================================================
+# District standardization
+# ============================================================
+standardize_districts <- function(df) {
+  df %>%
+    mutate(District = case_when(
+      Country == "COTE D'IVOIRE" & Region == "MORONOU" & District == "MBATTO" ~ "MBATTO",
+      Country == "COTE D'IVOIRE" & Region == "MORONOU" & District == "M'BATTO" ~ "MBATTO",
+      Country == "COTE D'IVOIRE" & Region == "ABIDJAN1" & District == "ABOBO_EST" ~ "ABOBO EST",
+      Country == "COTE D'IVOIRE" & Region == "ABIDJAN1" & District == "ABOBO_OUEST" ~ "ABOBO OUEST",
+      Country == "CHAD" & Region == "BATHA" & District == "OUM_HADJER" ~ "OUM_HADJER",
+      Country == "CHAD" & Region == "BATHA" & District == "OUM HADJER" ~ "OUM_HADJER",
+      Country == "CHAD" & Region == "NDJAMENA" & District == "NDJAMENA_SUD" ~ "N'DJAMENA-SUD",
+      Country == "CHAD" & Region == "NDJAMENA" & District == "NDJAMENA_NORD" ~ "N'DJAMENA-NORD",
+      Country == "BENIN" & Region == "LITTORAL" & District == "COTONOU 1" ~ "COTONOU 1",
+      Country == "BENIN" & Region == "LITTORAL" & District == "Cotonou I" ~ "COTONOU 1",
+      TRUE ~ District
+    ))
+}
+
+# ============================================================
+# Response standardization
+# ============================================================
+standardize_responses <- function(df) {
+  df %>%
+    mutate(Response = case_when(
+      Country == "COTE D'IVOIRE" & str_detect(Response, "ABENGOUROU|ABOBO_EST|ABOBO_OUEST|ABOISSO") ~ "CIV-113DS-09-2020",
+      Country == "MAL" & str_detect(Response, "Arfounda|BAMAKO|Banamba|Nara") ~ "MLI-12DS-01-2021",
+      TRUE ~ Response
+    ))
+}
+
+# ============================================================
+# Vaccine type assignment
+# ============================================================
+assign_vaccine_types <- function(df) {
+  df %>%
+    mutate(
+      roundNumber = toupper(roundNumber),
+      roundNumber = case_when(
+        str_detect(roundNumber, "0") ~ "Rnd0",
+        str_detect(roundNumber, "1") ~ "Rnd1",
+        str_detect(roundNumber, "2") ~ "Rnd2",
+        str_detect(roundNumber, "3") ~ "Rnd3",
+        str_detect(roundNumber, "4") ~ "Rnd4",
+        str_detect(roundNumber, "5") ~ "Rnd5",
+        str_detect(roundNumber, "6") ~ "Rnd6",
+        TRUE ~ roundNumber
+      )
+    ) %>%
+    mutate(
+      Vaccine.type = case_when(
+        Country == "BENIN" & Response == "KETOU" ~ "mOPV",
+        Country == "COG" & Response == "Congo" ~ "nOPV",
+        Country == "GUI" & Response == "Conakry" ~ "mOPV",
+        Country == "COTE D'IVOIRE" & Response == "CIV-113DS-09-2020" ~ "mOPV",
+        Country == "MAL" & Response == "MLI-12DS-01-2021" ~ "mOPV",
+        
+        str_detect(Response, "CHD-2025-10-0n_bOPV-NIDs|GUI-2025-01-NID_bOPV-nOPV") ~ "nOPV2 & bOPV",
+        
+        str_detect(Response, "BITTOU|MENAKA-mOPV2|BAMAKO-mOPV2|KANKAN-mOPV|MLI-12DS-01-2021-mOPV2|CONAKRY-mOPV|Ouagadogou|Bangui 1|GOTHEY|YOPOUGON|Golfe|MDG-2023-03-01_bOPV|BEN-xxDS-02-2020|BEN-26DS-08-2020|Chavuma-mOPV|Luapula-mOPV") ~ "mOPV",
+        
+        str_detect(Response, "nOPV|VPOn|TSHUAPA|Tanganyika|Liberia|Mauritania|KOUIBLY|Sierra Leone|SEN|CEN|MAL|BEN-39DS-01-2021|BERTOUA|EBOLOWA|EXNORD|ExtNord2023|ADDIS ABABA|Mekelle|AMANSIE SOUTH|CAF-2020-002|CENBLOCK|CENTRALBLK|CHA-17DS-02-2020|DONOMANGA|GNBnOPV|GOLFE|GOTHEYE|KEN-13DS-02-2021|MopUp2022|SSD-79DS-09-2020|ALG-2023-09-01_nOPV|ALG-2024-01-01_nOPV|nOPV2022|BEN-2023-09-01_nOPV|BFA-2023-05-01_nOPV|BFA-2023-09-01_nOPV|BFA-2024-02-01_nOPV|BITTOU-mOPV2|Ouagadogou-mOPV2|BOT-2023-02-01_nOPV|CAM-2023-05-01_nOPV|CAM-2023-08-01_nOPV|CAM-2024-02-01_nOPV|nOPV2023|nVPO|nVPO_Maradi|nVPO_Zinder|nVPO2|May2021|OPVb2021|OPVb2022|RSSmOPV10C2021|SEN_VPOn|UGAnOPV|VPOb|VPOb13ProV") ~ "nOPV2",
+        
+        str_detect(Response, "BOPV|bOPV|OPVb|WPV1") ~ "bOPV",
+        str_detect(Response, "mOPV") ~ "mOPV",
+        str_detect(Response, "OPV") & !str_detect(Response, "nOPV|bOPV|mOPV") ~ "bOPV",
+        TRUE ~ "other"
+      ),
+      
+      Response = case_when(
+        Response == "nOPV2022" & Country == "GHA" ~ "nOPV2022",
+        Response == "CENTRALBLK" ~ "DRC-7DS-02-2022",
+        Response == "nOPV2022" & Country == "RDC" ~ "DRC-39DS-01-2021",
+        Response %in% c("Tshuapa", "TSHUAPA") ~ "DRC-23DS-12-2020",
+        Response == "VPOb13ProV" ~ "DRC-39DS-01-2021",
+        TRUE ~ Response
+      )
+    ) %>%
+    mutate(
+      Vaccine.type = case_when(
+        Response == "DRC-2025-02-01_nOPV_sNID" &
+          roundNumber == "Rnd1" &
+          Region %in% c("HAUT KATANGA", "HAUT LOMAMI", "TANGANIKA", "KINSHASA") ~ "nOPV2",
+        
+        Response == "DRC-2025-02-01_nOPV_sNID" &
+          roundNumber == "Rnd1" &
+          Region == "TSHOPO" &
+          District %in% c("ALUNGULI", "FEREKENI", "KAILO", "LUBUTU", "OBOKOTE", "OPIENGE") ~ "bOPV",
+        
+        TRUE ~ Vaccine.type
+      )
+    )
+}
+
+# ============================================================
+# Final processing with QC
+# ============================================================
+process_final_data <- function(df) {
+  df %>%
+    mutate(
+      Country = case_when(
+        Country == "DRC" ~ "RDC",
+        Country == "Camerooun" ~ "CAE",
+        Country == "BURKINA_FASO" ~ "BFA",
+        Country == "CAMEROON" ~ "CAE",
+        Country == "CHAD" ~ "CHD",
+        TRUE ~ Country
+      ),
+      roundNumber = case_when(
+        roundNumber == "RND2" ~ "Rnd2",
+        TRUE ~ roundNumber
+      ),
+      
+      reasons_total =
+        r_non_FM_Absent +
+        r_non_FM_NC +
+        r_non_FM_hh_notvisited +
+        r_non_FM_hh_notrevisited +
+        r_non_FM_sleep +
+        r_non_FM_vaccinatedRoutine +
+        r_non_FM_other,
+      
+      check_missed = missed_child - reasons_total,
+      unexplained_missed = pmax(check_missed, 0),
+      overreported_reasons = pmax(-check_missed, 0),
+      
+      explained_ratio = ifelse(missed_child > 0, round(reasons_total / missed_child, 3), NA_real_),
+      unexplained_ratio = ifelse(missed_child > 0, round(unexplained_missed / missed_child, 3), NA_real_),
+      
+      check_abs_detail = r_non_FM_Absent - abs_detail_total,
+      check_nc_detail = r_non_FM_NC - nc_detail_total,
+      
+      reconciliation_flag = case_when(
+        check_missed == 0 ~ "Consistent",
+        check_missed > 0 & reasons_total == 0 ~ "No reasons recorded",
+        check_missed > 0 ~ "Partial reasons recorded",
+        check_missed < 0 ~ "Overlapping reasons",
+        TRUE ~ "Unknown"
+      ),
+      
+      abs_detail_flag = case_when(
+        check_abs_detail == 0 ~ "Abs detail consistent",
+        check_abs_detail > 0 ~ "Abs detail incomplete",
+        check_abs_detail < 0 ~ "Abs detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+      
+      nc_detail_flag = case_when(
+        check_nc_detail == 0 ~ "NC detail consistent",
+        check_nc_detail > 0 ~ "NC detail incomplete",
+        check_nc_detail < 0 ~ "NC detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+      
+      qc_flag = case_when(
+        check_missed == 0 & check_abs_detail == 0 & check_nc_detail == 0 ~ "OK",
+        TRUE ~ "Needs review"
+      )
+    )
+}
+
+# ============================================================
+# Apply transformations
+# ============================================================
+GJ <- GH %>%
+  mutate(
+    Number_of_HH_visited = as.numeric(Number_of_HH_visited),
+    Total_U5_Present = if ("Total_U5_Present" %in% names(.)) as.numeric(Total_U5_Present) else NA_real_,
+    TotalFM = if ("TotalFM" %in% names(.)) as.numeric(TotalFM) else NA_real_
+  ) %>%
+  standardize_districts()
+
+GO <- GJ %>% standardize_responses()
+GK <- GO %>% assign_vaccine_types()
+GL <- GK %>% process_final_data()
+
+# ============================================================
+# Ensure final columns exist before aggregation
+# ============================================================
+required_final_columns <- c(
+  "Country", "Region", "District", "Response", "Vaccine.type", "roundNumber",
+  "date_monitored", "Number_of_HH_visited", "u5_present", "u5_FM", "missed_child",
+  "r_non_FM_Absent", "r_non_FM_NC", "r_non_FM_hh_notvisited", "r_non_FM_hh_notrevisited",
+  "r_non_FM_sleep", "r_non_FM_vaccinatedRoutine", "r_non_FM_other",
+  "care_Giver_Informed_SIA",
+  "r_abs_sick", "r_abs_play_areas", "r_abs_market", "r_abs_school",
+  "r_abs_farm", "r_abs_social_event", "r_abs_travelling", "r_abs_parent_absent", "r_abs_other_detail",
+  "r_nc_religious_beliefs", "r_nc_side_effects", "r_nc_too_many_doses",
+  "r_nc_child_sick", "r_nc_covid", "r_nc_other_detail", "r_nc_not_decided",
+  "r_nc_polio_free", "r_nc_nopv",
+  "abs_detail_total", "nc_detail_total", "reasons_total",
+  "check_missed", "check_abs_detail", "check_nc_detail",
+  "unexplained_missed", "overreported_reasons",
+  "explained_ratio", "unexplained_ratio",
+  "reconciliation_flag", "abs_detail_flag", "nc_detail_flag", "qc_flag"
+)
+
+for (col in required_final_columns) {
+  if (!col %in% names(GL)) {
+    GL[[col]] <- NA
+  }
+}
+
+# ============================================================
+# Final aggregation
+# ============================================================
+F5 <- GL %>%
+  mutate(
+    start_date = as_date(date_monitored),
+    end_date = as_date(date_monitored),
+    year = year(start_date),
+    cv = ifelse(u5_present > 0, round(u5_FM / u5_present, 2), NA_real_),
+    percent_care_Giver_Informed_SIA = ifelse(
+      Number_of_HH_visited > 0,
+      round((care_Giver_Informed_SIA / Number_of_HH_visited) * 100, 2),
+      NA_real_
+    )
+  ) %>%
+  group_by(Country, Region, District, Response, Vaccine.type, roundNumber) %>%
+  summarise(
+    start_date = min(start_date, na.rm = TRUE),
+    end_date = max(end_date, na.rm = TRUE),
+    Number_of_HH_visited = sum(Number_of_HH_visited, na.rm = TRUE),
+    u5_present = sum(u5_present, na.rm = TRUE),
+    u5_FM = sum(u5_FM, na.rm = TRUE),
+    missed_child = sum(missed_child, na.rm = TRUE),
+    
+    r_non_FM_Absent = sum(r_non_FM_Absent, na.rm = TRUE),
+    r_non_FM_NC = sum(r_non_FM_NC, na.rm = TRUE),
+    r_non_FM_hh_notvisited = sum(r_non_FM_hh_notvisited, na.rm = TRUE),
+    r_non_FM_hh_notrevisited = sum(r_non_FM_hh_notrevisited, na.rm = TRUE),
+    r_non_FM_sleep = sum(r_non_FM_sleep, na.rm = TRUE),
+    r_non_FM_vaccinatedRoutine = sum(r_non_FM_vaccinatedRoutine, na.rm = TRUE),
+    r_non_FM_other = sum(r_non_FM_other, na.rm = TRUE),
+    
+    care_Giver_Informed_SIA = sum(care_Giver_Informed_SIA, na.rm = TRUE),
+    
+    r_abs_sick = sum(r_abs_sick, na.rm = TRUE),
+    r_abs_play_areas = sum(r_abs_play_areas, na.rm = TRUE),
+    r_abs_market = sum(r_abs_market, na.rm = TRUE),
+    r_abs_school = sum(r_abs_school, na.rm = TRUE),
+    r_abs_farm = sum(r_abs_farm, na.rm = TRUE),
+    r_abs_social_event = sum(r_abs_social_event, na.rm = TRUE),
+    r_abs_travelling = sum(r_abs_travelling, na.rm = TRUE),
+    r_abs_parent_absent = sum(r_abs_parent_absent, na.rm = TRUE),
+    r_abs_other_detail = sum(r_abs_other_detail, na.rm = TRUE),
+    
+    r_nc_religious_beliefs = sum(r_nc_religious_beliefs, na.rm = TRUE),
+    r_nc_side_effects = sum(r_nc_side_effects, na.rm = TRUE),
+    r_nc_too_many_doses = sum(r_nc_too_many_doses, na.rm = TRUE),
+    r_nc_child_sick = sum(r_nc_child_sick, na.rm = TRUE),
+    r_nc_covid = sum(r_nc_covid, na.rm = TRUE),
+    r_nc_other_detail = sum(r_nc_other_detail, na.rm = TRUE),
+    r_nc_not_decided = sum(r_nc_not_decided, na.rm = TRUE),
+    r_nc_polio_free = sum(r_nc_polio_free, na.rm = TRUE),
+    r_nc_nopv = sum(r_nc_nopv, na.rm = TRUE),
+    
+    abs_detail_total = sum(abs_detail_total, na.rm = TRUE),
+    nc_detail_total = sum(nc_detail_total, na.rm = TRUE),
+    reasons_total = sum(reasons_total, na.rm = TRUE),
+    
+    unexplained_missed = sum(unexplained_missed, na.rm = TRUE),
+    overreported_reasons = sum(overreported_reasons, na.rm = TRUE),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    cv = ifelse(u5_present > 0, round(u5_FM / u5_present, 2), NA_real_),
+    year = year(start_date),
+    percent_care_Giver_Informed_SIA = ifelse(
+      Number_of_HH_visited > 0,
+      round((care_Giver_Informed_SIA / Number_of_HH_visited) * 100, 2),
+      NA_real_
+    ),
+    check_missed = missed_child - reasons_total,
+    check_abs_detail = r_non_FM_Absent - abs_detail_total,
+    check_nc_detail = r_non_FM_NC - nc_detail_total,
+    explained_ratio = ifelse(missed_child > 0, round(reasons_total / missed_child, 3), NA_real_),
+    unexplained_ratio = ifelse(missed_child > 0, round(unexplained_missed / missed_child, 3), NA_real_),
+    reconciliation_flag = case_when(
+      check_missed == 0 ~ "Consistent",
+      check_missed > 0 & reasons_total == 0 ~ "No reasons recorded",
+      check_missed > 0 ~ "Partial reasons recorded",
+      check_missed < 0 ~ "Overlapping reasons",
+      TRUE ~ "Unknown"
+    ),
+    abs_detail_flag = case_when(
+      check_abs_detail == 0 ~ "Abs detail consistent",
+      check_abs_detail > 0 ~ "Abs detail incomplete",
+      check_abs_detail < 0 ~ "Abs detail overlapping",
+      TRUE ~ "Unknown"
+    ),
+    nc_detail_flag = case_when(
+      check_nc_detail == 0 ~ "NC detail consistent",
+      check_nc_detail > 0 ~ "NC detail incomplete",
+      check_nc_detail < 0 ~ "NC detail overlapping",
+      TRUE ~ "Unknown"
+    ),
+    qc_flag = case_when(
+      check_missed == 0 & check_abs_detail == 0 & check_nc_detail == 0 ~ "OK",
+      TRUE ~ "Needs review"
+    )
+  ) %>%
+  filter(start_date > as_date("2019-10-01"))
+
+# ============================================================
+# Preparedness date lookup
+# ============================================================
+date <- read_excel("C:/Users/TOURE/Documents/REPOSITORIES/LQAS_raw_data/harmonized_date/data (5).xlsx")
+
+date <- date %>%
+  mutate(`Round Number` = case_when(
+    `Round Number` == "Round 0" ~ "Rnd0",
+    `Round Number` == "Round 1" ~ "Rnd1",
+    `Round Number` == "Round 2" ~ "Rnd2",
+    `Round Number` == "Round 3" ~ "Rnd3",
+    `Round Number` == "Round 4" ~ "Rnd4",
+    `Round Number` == "Round 5" ~ "Rnd5",
+    `Round Number` == "Round 6" ~ "Rnd6",
+    TRUE ~ `Round Number`
+  ))
+
+prep_data <- date %>%
+  rename(
+    Response = `OBR Name`,
+    Vaccine.type = Vaccines,
+    roundNumber = `Round Number`
+  ) %>%
+  mutate(
+    round_start_date = as_date(`Round Start Date`),
+    round_start_date = case_when(
+      Country == "ALGERIA" & Response == "ALG-2024-01-01_nOPV" & roundNumber == "Rnd1" ~ as_date("2024-02-18"),
+      TRUE ~ round_start_date
+    ),
+    start_date = round_start_date + 4,
+    end_date = as_date(start_date) + 1
+  ) %>%
+  select(Response, Vaccine.type, roundNumber, round_start_date, start_date, end_date)
+
+lookup_table <- as_tibble(prep_data) %>%
+  mutate(
+    start_date = as_date(start_date),
+    end_date = as_date(end_date),
+    round_start_date = as_date(round_start_date)
+  )
+
+FI <- F5 %>%
+  left_join(
+    lookup_table,
+    by = c("Response", "Vaccine.type", "roundNumber"),
+    suffix = c("", "_lookup")
+  ) %>%
+  mutate(
+    start_date = coalesce(start_date_lookup, start_date),
+    end_date = coalesce(end_date_lookup, end_date),
+    round_start_date = coalesce(round_start_date, start_date - days(4))
+  ) %>%
+  select(-ends_with("_lookup")) %>%
+  filter(District != "NA")
+
+# ============================================================
+# Final export table
+# ============================================================
+FE <- FI %>%
+  select(
+    country = Country,
+    province = Region,
+    district = District,
+    response = Response,
+    vaccine.type = Vaccine.type,
+    roundNumber,
+    round_start_date,
+    start_date_IM_end = start_date,
+    end_date_IM_end = end_date,
+    year,
+    Number_of_HH_visited,
+    u5_present,
+    u5_FM,
+    missed_child,
+    cv,
+    
+    # Top-level reasons
+    r_non_FM_Absent,
+    r_non_FM_NC,
+    r_non_FM_hh_notvisited,
+    r_non_FM_hh_notrevisited,
+    r_non_FM_sleep,
+    r_non_FM_vaccinatedRoutine,
+    r_non_FM_other,
+    
+    # Detailed absence
+    r_abs_sick,
+    r_abs_play_areas,
+    r_abs_market,
+    r_abs_school,
+    r_abs_farm,
+    r_abs_social_event,
+    r_abs_travelling,
+    r_abs_parent_absent,
+    r_abs_other_detail,
+    
+    # Detailed NC
+    r_nc_religious_beliefs,
+    r_nc_side_effects,
+    r_nc_too_many_doses,
+    r_nc_child_sick,
+    r_nc_covid,
+    r_nc_other_detail,
+    r_nc_not_decided,
+    r_nc_polio_free,
+    r_nc_nopv,
+    
+    # Caregiver info
+    care_Giver_Informed_SIA,
+    percent_care_Giver_Informed_SIA,
+    
+    # QC
+    reasons_total,
+    abs_detail_total,
+    nc_detail_total,
+    check_missed,
+    check_abs_detail,
+    check_nc_detail,
+    unexplained_missed,
+    overreported_reasons,
+    explained_ratio,
+    unexplained_ratio,
+    reconciliation_flag,
+    abs_detail_flag,
+    nc_detail_flag,
+    qc_flag
+  ) %>%
+  arrange(start_date_IM_end)
+
+# ============================================================
+# QC export
+# ============================================================
+FE_QC <- FE %>%
+  filter(
+    qc_flag == "Needs review" |
+      abs(check_missed) >= 5 |
+      abs(check_abs_detail) >= 3 |
+      abs(check_nc_detail) >= 3
+  ) %>%
+  arrange(desc(abs(check_missed)), desc(abs(check_abs_detail)), desc(abs(check_nc_detail)))
+
+# ============================================================
+# Write outputs
+# ============================================================
+write_csv(FE, output_file)
+write_csv(FE_QC, qc_output_file)
+
+message("Processing completed successfully!")
+message("Output file: ", output_file)
+message("QC file: ", qc_output_file)
+message("Final dimensions: ", nrow(FE), " rows x ", ncol(FE), " columns")
+
+message("\nSummary of final data:")
+message("- Countries: ", paste(unique(FE$country), collapse = ", "))
+message("- Date range: ", min(FE$start_date_IM_end, na.rm = TRUE), " to ", max(FE$end_date_IM_end, na.rm = TRUE))
+message("- Total households: ", sum(FE$Number_of_HH_visited, na.rm = TRUE))
+message("- Total children: ", sum(FE$u5_present, na.rm = TRUE))
+
+message("\nQC summary:")
+print(FE %>% count(reconciliation_flag))
+print(FE %>% count(abs_detail_flag))
+print(FE %>% count(nc_detail_flag))
+print(FE %>% count(qc_flag))
