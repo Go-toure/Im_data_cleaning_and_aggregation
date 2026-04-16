@@ -172,6 +172,99 @@ build_hh_candidate_names <- function(hh_num, suffix) {
 }
 
 # ============================================================
+# SOCIAL MOBILIZATION HELPERS
+# ============================================================
+normalize_sm_text <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- tolower(x)
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
+  x <- gsub("[,;/|]+", " ", x)
+  x <- gsub("[[:space:]]+", " ", x)
+  trimws(x)
+}
+
+extract_sm_from_text <- function(df, cols) {
+  cols <- intersect(cols, names(df))
+  n <- nrow(df)
+  
+  empty_out <- tibble(
+    sm_info_tv_text = rep(0, n),
+    sm_info_radio_text = rep(0, n),
+    sm_info_others_text = rep(0, n),
+    sm_info_hworker_text = rep(0, n),
+    sm_info_mob_vanpa_text = rep(0, n),
+    sm_info_town_crier_text = rep(0, n),
+    sm_info_volunteers_text = rep(0, n),
+    sm_info_com_infocentre_text = rep(0, n),
+    sm_info_community_leader_text = rep(0, n),
+    sm_info_religious_leader_text = rep(0, n),
+    sm_info_mobile_social_media_text = rep(0, n),
+    sm_info_h2h_mobilizer_text = rep(0, n),
+    sm_info_mourchidate_text = rep(0, n),
+    sm_info_mosque_text = rep(0, n),
+    sm_info_vaccinators_text = rep(0, n),
+    sm_info_sticker_text = rep(0, n)
+  )
+  
+  if (length(cols) == 0) return(empty_out)
+  
+  txt <- apply(df[, cols, drop = FALSE], 1, function(x) {
+    paste(normalize_sm_text(x), collapse = " ")
+  })
+  
+  txt <- gsub("[[:space:]]+", " ", txt)
+  txt <- trimws(txt)
+  
+  tibble(
+    sm_info_tv_text = as.numeric(str_detect(txt, "\\btv\\b|television")),
+    sm_info_radio_text = as.numeric(str_detect(txt, "\\bradio\\b")),
+    sm_info_others_text = as.numeric(str_detect(txt, "\\bothers\\b|\\bother\\b|\\bautres\\b|\\bautre\\b")),
+    sm_info_hworker_text = as.numeric(str_detect(
+      txt,
+      "\\bhealth_worker\\b|\\bhworker\\b|health worker|agent de sante|agent sante|personnel de sante|hospital|hopital|centre de sante|vaccinateurs|vaccinator"
+    )),
+    sm_info_mob_vanpa_text = as.numeric(str_detect(txt, "\\bmob_vanpa\\b|van pa|megaphone car|car with megaphone")),
+    sm_info_town_crier_text = as.numeric(str_detect(
+      txt,
+      "\\btown_crier\\b|town crier|gong_gong|gong gong|crieur public|crieurs public"
+    )),
+    sm_info_volunteers_text = as.numeric(str_detect(txt, "\\bvolunteers\\b|volunteer|benevole|benevoles")),
+    sm_info_com_infocentre_text = as.numeric(str_detect(
+      txt,
+      "\\bcom_info_centre\\b|community information centre|centre d information|centre information"
+    )),
+    sm_info_community_leader_text = as.numeric(str_detect(
+      txt,
+      "\\bcommunity_leader\\b|community leader|chef communautaire|leader communautaire|chef de quartier|quartier"
+    )),
+    sm_info_religious_leader_text = as.numeric(str_detect(
+      txt,
+      "\\breligious_leader\\b|religious leader|leader religieux|chef religieux|imam|mosque|mosquee"
+    )),
+    sm_info_mobile_social_media_text = as.numeric(str_detect(
+      txt,
+      "\\bmobilemessaging_socialmedia\\b|social media|sms|telephone|phone|whatsapp|facebook|reseaux sociaux|reseau social"
+    )),
+    sm_info_h2h_mobilizer_text = as.numeric(str_detect(
+      txt,
+      "\\bh2h_mobilizer\\b|house to house|door to door|bouche a oreille|bouche a l oreille|voisin|voisinage|neighbor|neighbour"
+    )),
+    sm_info_mourchidate_text = as.numeric(str_detect(txt, "\\bmourchidate\\b")),
+    sm_info_mosque_text = as.numeric(str_detect(txt, "\\bmosque\\b|mosquee|masjid")),
+    sm_info_vaccinators_text = as.numeric(str_detect(txt, "\\bvaccinators\\b|vaccinator|vaccinateurs")),
+    sm_info_sticker_text = as.numeric(str_detect(txt, "\\bsticker\\b|poster|affiche"))
+  )
+}
+
+coalesce_max <- function(...) {
+  vals <- list(...)
+  vals <- vals[!vapply(vals, is.null, logical(1))]
+  if (length(vals) == 0) return(NULL)
+  do.call(pmax, c(vals, na.rm = TRUE))
+}
+
+# ============================================================
 # INPUT READER
 # ============================================================
 read_input_data <- function(input_file) {
@@ -286,17 +379,6 @@ sm_count_candidates <- list(
   sm_info_mobile_social_media   = c("SourceInfo_MobileMessaging_SocialMedia_count")
 )
 
-algeria_sm_hh_patterns <- list(
-  sm_info_radio_hh         = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Radio$",
-  sm_info_mourchidate_hh   = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Mourchidate$",
-  sm_info_mosque_hh        = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Mosque$",
-  sm_info_vaccinators_hh   = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Vaccinators$",
-  sm_info_h2h_mobilizer_hh = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/H2H_Mobilizer$",
-  sm_info_sticker_hh       = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Sticker$",
-  sm_info_others_hh        = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Others$",
-  sm_info_other_text_hh    = "^HH\\[[0-9]+\\]/Other_Source_Info$"
-)
-
 standard_sm_hh_patterns <- list(
   sm_info_tv_hh                  = "^HH\\[[0-9]+\\]/HH/SourceInfo_TV$",
   sm_info_radio_hh               = "^HH\\[[0-9]+\\]/HH/SourceInfo_Radio$",
@@ -310,6 +392,24 @@ standard_sm_hh_patterns <- list(
   sm_info_religious_leader_hh    = "^HH\\[[0-9]+\\]/HH/SourceInfo_Religious_leader$",
   sm_info_mobile_social_media_hh = "^HH\\[[0-9]+\\]/HH/SourceInfo_MobileMessaging_SocialMedia$",
   sm_info_other_text_hh          = "^HH\\[[0-9]+\\]/HH/Other_Source_Info$"
+)
+
+algeria_sm_hh_patterns <- list(
+  sm_info_radio_hh         = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Radio$",
+  sm_info_mourchidate_hh   = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Mourchidate$",
+  sm_info_mosque_hh        = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Mosque$",
+  sm_info_vaccinators_hh   = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Vaccinators$",
+  sm_info_h2h_mobilizer_hh = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/H2H_Mobilizer$",
+  sm_info_sticker_hh       = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Sticker$",
+  sm_info_others_hh        = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Others$",
+  sm_info_other_text_hh    = "^HH\\[[0-9]+\\]/Other_Source_Info$"
+)
+
+sm_text_patterns <- list(
+  sm_source_text_hh  = "^HH\\[[0-9]+\\]/HH/Source_Info_SIA_HH$",
+  sm_other_text_hh   = "^HH\\[[0-9]+\\]/HH/Other_Source_Info$",
+  sm_source_text_alg = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH$",
+  sm_other_text_alg  = "^HH\\[[0-9]+\\]/Other_Source_Info$"
 )
 
 # ============================================================
@@ -417,7 +517,8 @@ select_columns_dynamically <- function(df, required_cols, hh_patterns, hh_count 
     unlist(algeria_abs_hh_patterns),
     unlist(algeria_nc_hh_patterns),
     unlist(algeria_sm_hh_patterns),
-    unlist(standard_sm_hh_patterns)
+    unlist(standard_sm_hh_patterns),
+    unlist(sm_text_patterns)
   )) {
     selected_cols <- unique(c(selected_cols, grep(p, names(df), value = TRUE)))
   }
@@ -608,6 +709,9 @@ create_summary_columns <- function(df, file_name) {
   nc_nopv_hh_cols      <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_nopv_hh)
   nc_other_hh_cols     <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_other_hh)
   
+  # -----------------------------
+  # SM: one-hot HH fields
+  # -----------------------------
   sm_tv_hh_cols                  <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_tv_hh)
   sm_radio_hh_cols               <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_radio_hh)
   sm_others_hh_cols              <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_others_hh)
@@ -620,6 +724,7 @@ create_summary_columns <- function(df, file_name) {
   sm_religious_leader_hh_cols    <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_religious_leader_hh)
   sm_mobile_social_media_hh_cols <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_mobile_social_media_hh)
   
+  # Algeria-style one-hot HH fields
   sm_radio_alg_hh_cols         <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_radio_hh)
   sm_mourchidate_hh_cols       <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_mourchidate_hh)
   sm_mosque_hh_cols            <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_mosque_hh)
@@ -628,7 +733,18 @@ create_summary_columns <- function(df, file_name) {
   sm_sticker_hh_cols           <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_sticker_hh)
   sm_others_alg_hh_cols        <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_others_hh)
   
-  df %>%
+  # -----------------------------
+  # SM: combined text field
+  # -----------------------------
+  sm_text_cols <- unique(c(
+    get_regex_cols(df, sm_text_patterns$sm_source_text_hh),
+    get_regex_cols(df, sm_text_patterns$sm_source_text_alg)
+  ))
+  
+  sm_text_parsed <- extract_sm_from_text(df, sm_text_cols)
+  df2 <- bind_cols(df, sm_text_parsed)
+  
+  df2 %>%
     mutate(
       u5_present = safe_row_sum(., present_cols),
       u5_FM1 = safe_row_sum(., fm_cols),
@@ -716,31 +832,31 @@ create_summary_columns <- function(df, file_name) {
       r_nc_child_sick = pmax(r_nc_child_sick_form, r_nc_child_sick_hh, na.rm = TRUE),
       r_nc_other_detail = pmax(r_nc_other_detail_form, r_nc_other_hh, na.rm = TRUE),
       
-      sm_info_tv = pmax(sm_info_tv_count, sm_info_tv_hh, na.rm = TRUE),
-      sm_info_radio = pmax(sm_info_radio_count, sm_info_radio_hh, sm_info_radio_alg_hh, na.rm = TRUE),
-      sm_info_others = pmax(sm_info_others_count, sm_info_others_hh, sm_info_others_alg_hh, na.rm = TRUE),
-      sm_info_hworker = pmax(sm_info_hworker_count, sm_info_hworker_hh, na.rm = TRUE),
-      sm_info_mob_vanpa = pmax(sm_info_mob_vanpa_count, sm_info_mob_vanpa_hh, na.rm = TRUE),
-      sm_info_town_crier = pmax(sm_info_town_crier_count, sm_info_town_crier_hh, na.rm = TRUE),
-      sm_info_volunteers = pmax(sm_info_volunteers_count, sm_info_volunteers_hh, na.rm = TRUE),
-      sm_info_com_infocentre = pmax(sm_info_com_infocentre_count, sm_info_com_infocentre_hh, na.rm = TRUE),
-      sm_info_community_leader = pmax(sm_info_community_leader_count, sm_info_community_leader_hh, na.rm = TRUE),
-      sm_info_religious_leader = pmax(sm_info_religious_leader_count, sm_info_religious_leader_hh, na.rm = TRUE),
-      sm_info_mobile_social_media = pmax(sm_info_mobile_social_media_count, sm_info_mobile_social_media_hh, na.rm = TRUE),
+      sm_info_tv = coalesce_max(sm_info_tv_count, sm_info_tv_hh, sm_info_tv_text),
+      sm_info_radio = coalesce_max(sm_info_radio_count, sm_info_radio_hh, sm_info_radio_alg_hh, sm_info_radio_text),
+      sm_info_others = coalesce_max(sm_info_others_count, sm_info_others_hh, sm_info_others_alg_hh, sm_info_others_text),
+      sm_info_hworker = coalesce_max(sm_info_hworker_count, sm_info_hworker_hh, sm_info_hworker_text),
+      sm_info_mob_vanpa = coalesce_max(sm_info_mob_vanpa_count, sm_info_mob_vanpa_hh, sm_info_mob_vanpa_text),
+      sm_info_town_crier = coalesce_max(sm_info_town_crier_count, sm_info_town_crier_hh, sm_info_town_crier_text),
+      sm_info_volunteers = coalesce_max(sm_info_volunteers_count, sm_info_volunteers_hh, sm_info_volunteers_text),
+      sm_info_com_infocentre = coalesce_max(sm_info_com_infocentre_count, sm_info_com_infocentre_hh, sm_info_com_infocentre_text),
+      sm_info_community_leader = coalesce_max(sm_info_community_leader_count, sm_info_community_leader_hh, sm_info_community_leader_text),
+      sm_info_religious_leader = coalesce_max(sm_info_religious_leader_count, sm_info_religious_leader_hh, sm_info_religious_leader_text),
+      sm_info_mobile_social_media = coalesce_max(sm_info_mobile_social_media_count, sm_info_mobile_social_media_hh, sm_info_mobile_social_media_text),
       
-      sm_info_mourchidate = sm_info_mourchidate_hh,
-      sm_info_mosque = sm_info_mosque_hh,
-      sm_info_vaccinators = sm_info_vaccinators_hh,
-      sm_info_h2h_mobilizer = sm_info_h2h_mobilizer_hh,
-      sm_info_sticker = sm_info_sticker_hh,
+      sm_info_h2h_mobilizer = coalesce_max(sm_info_h2h_mobilizer_hh, sm_info_h2h_mobilizer_text),
+      sm_info_mourchidate = coalesce_max(sm_info_mourchidate_hh, sm_info_mourchidate_text),
+      sm_info_mosque = coalesce_max(sm_info_mosque_hh, sm_info_mosque_text),
+      sm_info_vaccinators = coalesce_max(sm_info_vaccinators_hh, sm_info_vaccinators_text),
+      sm_info_sticker = coalesce_max(sm_info_sticker_hh, sm_info_sticker_text),
       
       sm_total_sources =
         sm_info_tv + sm_info_radio + sm_info_others + sm_info_hworker +
         sm_info_mob_vanpa + sm_info_town_crier + sm_info_volunteers +
         sm_info_com_infocentre + sm_info_community_leader +
         sm_info_religious_leader + sm_info_mobile_social_media +
-        sm_info_mourchidate + sm_info_mosque + sm_info_vaccinators +
-        sm_info_h2h_mobilizer + sm_info_sticker,
+        sm_info_h2h_mobilizer + sm_info_mourchidate + sm_info_mosque +
+        sm_info_vaccinators + sm_info_sticker,
       
       abs_detail_total =
         r_abs_sick + r_abs_play_areas + r_abs_market + r_abs_school +
@@ -1336,7 +1452,7 @@ batch_run <- process_all_im_files(
 summary_table <- batch_run$summary_table
 processed_results <- batch_run$processed_results
 
-# write_csv(summary_table, summary_file)
+write_csv(summary_table, summary_file)
 
 regional_repo <- build_regional_im_repository(
   processed_results = processed_results,
