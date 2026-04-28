@@ -1,0 +1,1833 @@
+# ============================================================
+# Batch regional IM cleaning + Regional IM repository builder
+# Full updated version with:
+# - multi-format input reading
+# - Algeria U6 logic for form 8587
+# - generic regional U5 logic
+# - missed/reasons QC
+# - SM integrated from:
+#     1) form-level counts
+#     2) one-hot HH columns
+#     3) combined text fields Source_Info_SIA_HH / Other_Source_Info
+#     4) space-separated value format (Mauritania, etc.)
+# - expanded SM parser for coded + localized free-text values
+# - SM reconciliation QC
+# - safe regional repository builder
+# - OPTIMIZED: vectorized SM text processing for speed
+# ============================================================
+
+pacman::p_load(
+  tidyverse, lubridate, readxl, readr, tools, tibble, qs, stringr, arrow
+)
+
+# ============================================================
+# USER PATHS
+# ============================================================
+input_folder <- "C:/Users/TOURE/Documents/PADACORD/IM/"
+output_folder <- "C:/Users/TOURE/Documents/PADACORD/IM_c/"
+qc_output_folder <- "C:/Users/TOURE/Documents/PADACORD/IM_c/QC/"
+preparedness_file <- "C:/Users/TOURE/Documents/REPOSITORIES/LQAS_raw_data/harmonized_date/data (5).xlsx"
+
+regional_repository_file <- file.path(output_folder, "Regional_IM_repository.csv")
+regional_qc_repository_file <- file.path(output_folder, "Regional_IM_repository_QC.csv")
+summary_file <- file.path(output_folder, "IM_processing_summary.csv")
+
+if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
+if (!dir.exists(qc_output_folder)) dir.create(qc_output_folder, recursive = TRUE)
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+ALGERIA_IM_FORM_ID <- "8587"
+
+# ============================================================
+# HELPERS
+# ============================================================
+parse_mixed_dates <- function(x) {
+  x <- as.character(x)
+  suppressWarnings(
+    dplyr::coalesce(
+      ymd(x),
+      dmy(x),
+      mdy(x),
+      ymd_hms(x),
+      dmy_hms(x),
+      mdy_hms(x)
+    )
+  )
+}
+
+clean_numeric <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[x %in% c("", " ", "n/a", "NA", "NaN", "null", "NULL")] <- "0"
+  suppressWarnings(as.numeric(x))
+}
+
+clean_yes_no_numeric <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  dplyr::case_when(
+    x %in% c("Y", "YES", "Yes", "yes", "1", "TRUE", "True", "true") ~ 1,
+    x %in% c("N", "NO", "No", "no", "0", "FALSE", "False", "false") ~ 0,
+    x %in% c("", " ", "n/a", "NA", "NaN", "null", "NULL") ~ 0,
+    TRUE ~ suppressWarnings(as.numeric(x))
+  )
+}
+
+safe_row_sum <- function(df, cols) {
+  cols <- intersect(cols, names(df))
+  if (length(cols) == 0) return(rep(0, nrow(df)))
+  temp <- df[, cols, drop = FALSE]
+  temp[] <- lapply(temp, function(x) suppressWarnings(as.numeric(as.character(x))))
+  rowSums(temp, na.rm = TRUE)
+}
+
+safe_pick_first <- function(df, candidates, default = 0) {
+  candidates <- intersect(candidates, names(df))
+  if (length(candidates) == 0) return(rep(default, nrow(df)))
+  suppressWarnings(as.numeric(as.character(df[[candidates[1]]])))
+}
+
+rename_repetitive_columns <- function(data) {
+  pattern <- "^HH\\[\\d+\\]/HH/"
+  new_columns <- sapply(colnames(data), function(col) {
+    if (grepl(pattern, col)) gsub("HH/", "", col) else col
+  })
+  colnames(data) <- new_columns
+  data
+}
+
+bind_rows_fill <- function(df_list) {
+  df_list <- Filter(function(x) !is.null(x), df_list)
+  if (length(df_list) == 0) return(tibble())
+  
+  all_cols <- unique(unlist(lapply(df_list, names)))
+  
+  prototypes <- list()
+  for (col in all_cols) {
+    for (df in df_list) {
+      if (col %in% names(df)) {
+        prototypes[[col]] <- df[[col]]
+        break
+      }
+    }
+  }
+  
+  df_list2 <- lapply(df_list, function(x) {
+    missing <- setdiff(all_cols, names(x))
+    
+    if (length(missing) > 0) {
+      for (m in missing) {
+        proto <- prototypes[[m]]
+        
+        if (is.character(proto)) {
+          x[[m]] <- rep(NA_character_, nrow(x))
+        } else if (is.numeric(proto)) {
+          x[[m]] <- rep(NA_real_, nrow(x))
+        } else if (is.integer(proto)) {
+          x[[m]] <- rep(NA_integer_, nrow(x))
+        } else if (inherits(proto, "Date")) {
+          x[[m]] <- as.Date(rep(NA_character_, nrow(x)))
+        } else if (inherits(proto, "POSIXct")) {
+          x[[m]] <- as.POSIXct(rep(NA_character_, nrow(x)), origin = "1970-01-01")
+        } else if (is.logical(proto)) {
+          x[[m]] <- rep(NA, nrow(x))
+        } else {
+          x[[m]] <- rep(NA_character_, nrow(x))
+        }
+      }
+    }
+    
+    x[, all_cols, drop = FALSE]
+  })
+  
+  bind_rows(df_list2)
+}
+
+find_similar_column <- function(target_name, df, exact_first = TRUE) {
+  cols <- names(df)
+  
+  if (exact_first && target_name %in% cols) {
+    return(target_name)
+  }
+  
+  target_norm <- tolower(target_name)
+  target_norm <- gsub("[\\[\\]/ _-]", "", target_norm)
+  
+  cols_norm <- tolower(cols)
+  cols_norm <- gsub("[\\[\\]/ _-]", "", cols_norm)
+  
+  idx <- which(cols_norm == target_norm)
+  if (length(idx) > 0) return(cols[idx[1]])
+  
+  idx2 <- which(grepl(target_norm, cols_norm, fixed = TRUE))
+  if (length(idx2) > 0) return(cols[idx2[1]])
+  
+  NA_character_
+}
+
+get_regex_cols <- function(df, pattern) {
+  grep(pattern, names(df), value = TRUE)
+}
+
+build_hh_candidate_names <- function(hh_num, suffix) {
+  c(
+    sprintf("HH[%s]/%s", hh_num, suffix),
+    sprintf("HH[%s]/group1/%s", hh_num, suffix),
+    sprintf("HH[%s]/group2/%s", hh_num, suffix),
+    sprintf("HH[%s]/group4/%s", hh_num, suffix),
+    sprintf("HH[%s]/HH/%s", hh_num, suffix),
+    sprintf("HH_%s_%s", hh_num, suffix),
+    sprintf("HH%s_%s", hh_num, suffix)
+  )
+}
+
+# ============================================================
+# SOCIAL MOBILIZATION HELPERS - OPTIMIZED VECTORIZED VERSION
+# ============================================================
+normalize_sm_text <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- tolower(x)
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
+  x <- gsub("[,;/|]+", " ", x)
+  x <- gsub("[[:space:]]+", " ", x)
+  trimws(x)
+}
+
+# Vectorized version - processes all rows at once for speed
+extract_sm_from_text <- function(df, cols) {
+  cols <- intersect(cols, names(df))
+  n <- nrow(df)
+  
+  # Initialize result matrix
+  result <- matrix(0L, nrow = n, ncol = 19)
+  colnames(result) <- c(
+    "tv", "radio", "others", "hworker", "mob_vanpa", "town_crier",
+    "volunteers", "com_infocentre", "community_leader", "religious_leader",
+    "mobile_social_media", "h2h_mobilizer", "mourchidate", "mosque",
+    "vaccinators", "sticker", "newspaper", "teachers_student", "iec_materials"
+  )
+  
+  if (length(cols) == 0) {
+    return(as_tibble(as.data.frame(result)))
+  }
+  
+  # Combine all text columns efficiently
+  txt <- apply(df[, cols, drop = FALSE], 1, function(x) {
+    paste(normalize_sm_text(x), collapse = " ")
+  })
+  
+  txt <- gsub("[[:space:]]+", " ", txt)
+  txt <- trimws(txt)
+  
+  # Remove non-informative words in one pass
+  txt <- gsub(
+    regex("\\b(oui|yes|non|no|0|1|00|nn|na|n/a|ras|personal|people|sociaux|other people|la sh|pas de probleme|bien passe|non informe)\\b", 
+          ignore_case = TRUE),
+    " ",
+    txt
+  )
+  txt <- gsub("[[:space:]]+", " ", txt)
+  txt <- trimws(txt)
+  
+  # Detect space-separated format (Mauritania style)
+  is_space_sep <- grepl("^[a-z_]+( [a-z_]+)*$", txt) & !grepl(" ", txt) & nchar(txt) < 500
+  space_sep_idx <- which(is_space_sep)
+  free_text_idx <- which(!is_space_sep)
+  
+  # Process space-separated rows (Mauritania format)
+  if (length(space_sep_idx) > 0) {
+    for (idx in space_sep_idx) {
+      tokens <- strsplit(txt[idx], " ")[[1]]
+      for (token in tokens) {
+        if (token %in% c("tv", "television", "télévision", "تلفاز", "التلفاز", "التلفزة")) {
+          result[idx, "tv"] <- 1
+        } else if (token %in% c("radio", "مذياع", "المذياع")) {
+          result[idx, "radio"] <- 1
+        } else if (token %in% c("others", "other", "autres", "autre", "اخر", "اخرون")) {
+          result[idx, "others"] <- 1
+        } else if (token %in% c("health_worker", "hworker", "agent de sante", "personnel de sante", 
+                                "hopital", "hospital", "مستشفى", "المستوصف", "ممرضة", "طاقم طبي")) {
+          result[idx, "hworker"] <- 1
+        } else if (token %in% c("mob_vanpa", "van pa", "megaphone car", "haut parleur", "مكبرات الصوت", "الفرق المتنقلة")) {
+          result[idx, "mob_vanpa"] <- 1
+        } else if (token %in% c("town_crier", "gong_gong", "crieur public", "تحسيس")) {
+          result[idx, "town_crier"] <- 1
+        } else if (token %in% c("volunteers", "volunteer", "benevole", "جمعية", "avs")) {
+          result[idx, "volunteers"] <- 1
+        } else if (token %in% c("com_info_centre", "community information centre", "centre d information")) {
+          result[idx, "com_infocentre"] <- 1
+        } else if (token %in% c("community_leader", "community leader", "chef de quartier", "voisin", "الجيران")) {
+          result[idx, "community_leader"] <- 1
+        } else if (token %in% c("religious_leader", "religious leader", "imam", "المسجد")) {
+          result[idx, "religious_leader"] <- 1
+        } else if (token %in% c("mobilemessaging_socialmedia", "social media", "facebook", "whatsapp", 
+                                "sms", "telephone", "وسائل التواصل الاجتماعي", "فيسبوك")) {
+          result[idx, "mobile_social_media"] <- 1
+        } else if (token %in% c("h2h_mobilizer", "house to house", "door to door", "bouche a oreille", "العائلة")) {
+          result[idx, "h2h_mobilizer"] <- 1
+        } else if (token %in% c("mourchidate", "مرشدون", "مرشدات")) {
+          result[idx, "mourchidate"] <- 1
+        } else if (token %in% c("mosque", "mosquee", "masjid")) {
+          result[idx, "mosque"] <- 1
+        } else if (token %in% c("vaccinators", "vaccinator", "vaccinateurs", "ملقحات", "محققين")) {
+          result[idx, "vaccinators"] <- 1
+        } else if (token %in% c("sticker", "poster", "affiche", "ملصقات")) {
+          result[idx, "sticker"] <- 1
+        } else if (token %in% c("newspaper", "الأعلام")) {
+          result[idx, "newspaper"] <- 1
+        } else if (token %in% c("teachers_student", "school", "ecole", "école", "مدرسة", "معلمة")) {
+          result[idx, "teachers_student"] <- 1
+        } else if (token %in% c("iec_materials", "محاضرات", "التطعيم")) {
+          result[idx, "iec_materials"] <- 1
+        }
+      }
+    }
+  }
+  
+  # Process free-text rows (Algeria, etc.) - vectorized for speed
+  if (length(free_text_idx) > 0) {
+    txt_free <- txt[free_text_idx]
+    
+    result[free_text_idx, "tv"] <- as.integer(str_detect(txt_free, regex("\\btv\\b|television|t[eé]l[eé]vision|تلفاز|التلفاز|التلفزة|قنواة التلفاز النهار", ignore_case = TRUE)))
+    result[free_text_idx, "radio"] <- as.integer(str_detect(txt_free, regex("\\bradio\\b|مذياع|المذياع", ignore_case = TRUE)))
+    result[free_text_idx, "others"] <- as.integer(str_detect(txt_free, regex("\\bothers\\b|\\bother\\b|\\bautres\\b|\\bautre\\b|اخر|اخرون|اشخاص اخرون|أشخاص آخرون|بين الاشخاص|بين الأشخاص|تداول بين الاشخاص|تداول بين الأشخاص|الأهل فيما بينهم|معلومات انتشرت في المجتمع|الشعب|الناس|rue|dans la rue|dans les rues|في الشارع", ignore_case = TRUE)))
+    result[free_text_idx, "hworker"] <- as.integer(str_detect(txt_free, regex("\\bhealth_worker\\b|\\bhworker\\b|health worker|agent de sante|agent sante|personnel de sante|personnel de santé|طاقم طبي|طاقم الطبي|عامل بقطاع الصحة|عامل في قطاع الصحة|عامل ف الصحة|عامل في قطاع الصخة|من عمال الصحه|من عمال الصحه|ممرضة|ممرض|زوج ممرض|الام ممرضة|الأم ممرضة|المستوصف|االمستوصف|مستوصف|hopital|hospital|مستشفى|المستشفى|في المستشفى|من المستشفى|centre de sante|العيادة|في العيادة|العيادة متعددة الخدمات|قاعة العلاج|pharmacie|مصلحة الوقاية|مكتب التلقيح|المؤسسات العمومية للصحة الجوارية|المؤسسة العمومية للصحة الجوارية|مؤسسة عمومية للصحة الجوارية|عبادة متعددة الخدمات", ignore_case = TRUE)))
+    result[free_text_idx, "mob_vanpa"] <- as.integer(str_detect(txt_free, regex("\\bmob_vanpa\\b|van pa|megaphone car|car with megaphone|haut parleur|مكبرات الصوت|مكبر الصوت|مبكر الصوت|ميكروفون|سيارة الاسعاف|سيارة  الاسعاف|ambulance a la maison haut parleur|ambulance a haut parleur|الفرق المتنقلة|الفرقة المتنقلة|فرقة متنقلة|الفرقة المتنقلة للتلقيح في الحي|equipe mobile|فريق متنقل", ignore_case = TRUE)))
+    result[free_text_idx, "town_crier"] <- as.integer(str_detect(txt_free, regex("\\btown_crier\\b|town crier|gong_gong|gong gong|crieur public|crieurs public|تحسيس|الحملات التحسيسية", ignore_case = TRUE)))
+    result[free_text_idx, "volunteers"] <- as.integer(str_detect(txt_free, regex("\\bvolunteers\\b|volunteer|benevole|benevoles|جمعية|الجمعية|جمعيات|الجمعيات|جمعية الحي|جمعيات الحي|avs\\b|evole", ignore_case = TRUE)))
+    result[free_text_idx, "com_infocentre"] <- as.integer(str_detect(txt_free, regex("\\bcom_info_centre\\b|community information centre|centre d information|centre information", ignore_case = TRUE)))
+    result[free_text_idx, "community_leader"] <- as.integer(str_detect(txt_free, regex("\\bcommunity_leader\\b|community leader|chef communautaire|leader communautaire|chef de quartier|quartier|les habitants du quartier|المجتمع|الجتمع|الجيران|جيران|الجار|الجارة|احد الجيران|أحد الجيران|من الجيران|les voisins|les voisin|voisin|voisine|voisins|voisinage|voisinages|neighbor|neighbour|voision|vois|أشخاص آخرون جيران|عبر الخيران|جيرانى|ااجيران|les voisin", ignore_case = TRUE)))
+    result[free_text_idx, "religious_leader"] <- as.integer(str_detect(txt_free, regex("\\breligious_leader\\b|religious leader|leader religieux|chef religieux|imam|mosque|mosquee|masjid|mourchidate|المسجد|المساجد|مرشدون|مرشدات|مرشدون اجتماعين|مرشدون جتماعين", ignore_case = TRUE)))
+    result[free_text_idx, "mobile_social_media"] <- as.integer(str_detect(txt_free, regex("\\bmobilemessaging_socialmedia\\b|social media|facebook|face book|facebok|facebok|fecbook|facook|fasbook|فيسبوك|فيس بوك|فايس بوك|الفيس بوك|الفايس بوك|الفايسبوك|الفسبوك|فيسبو|فيسب وك|فيسبوك\\.|فيس بوك،|فيس بوك ،|فيس بوك صفحة البلاد|وسائل التواصل الاجتماعي|وسائط الاجتماعية|وسائل التواصل|التواصل الاجتماعي|التواصل الإجتماعي|مواقع التواصل الاجتماعي|مواقع التواصل الإجتماعي|مواقع التوصل الاجتماعية|المواقع الإجتماعية|المواقع الاجتماعيه|موقع التواصل الاجتماعي|موقع التواصل الإجتماعي|موقع التواصل الآجتماعي fb|reseaux sociaux|reseux sociaux|reseau sociaux|reseau social|réseau sociaux|sms|الهاتف|هاتف|عبر الهاتف|telephone|t[eé]l[eé]phone|whatsapp|صفحة وات ساب|الانترنت|internet|إنترنت|منصات تواصل الإجتماعي|facebook", ignore_case = TRUE)))
+    result[free_text_idx, "h2h_mobilizer"] <- as.integer(str_detect(txt_free, regex("\\bh2h_mobilizer\\b|house to house|door to door|bouche a oreille|bouche a l oreille|bouche a bouche|من الأهل|عن طريق العائلة|العائلة|عائلة|famille|la famille|الأهل|الاهل|الأقارب|الاقارب|اقارب|من عند فرد من العائلة|الأصدقاء|الاصدقاء|أصدقاء|اصدقاء|amis|amie|coll[eè]gue|زملاء العمل|مكان عمل الزوج|في عمل ولي الأمر|معلمة|المعلمة|المعلمة الحي|معلمة المدرسة|معلمة الحضانه|معلمة ابنها في الروضة|voisins et ecole|voisins et  ecole|voisins, ecole|voisins..ecole|voisin et ecole|ecole, voisins|ecole,vousins|school|[ée]cole|l'ecole|في المدرسة|من المدرسة|تلقيح في المدرسة|ecole des enfants|les voisins|voisins|voisin|voisine|les voisin|la famille|سمعت من عند فرد من العائلة", ignore_case = TRUE)))
+    result[free_text_idx, "mourchidate"] <- as.integer(str_detect(txt_free, regex("\\bmourchidate\\b|مرشدون|مرشدات|مرشدون اجتماعين|مرشدون جتماعين", ignore_case = TRUE)))
+    result[free_text_idx, "mosque"] <- as.integer(str_detect(txt_free, regex("\\bmosque\\b|mosquee|masjid|imam|المسجد|المساجد", ignore_case = TRUE)))
+    result[free_text_idx, "vaccinators"] <- as.integer(str_detect(txt_free, regex("\\bvaccinators\\b|vaccinator|vaccinateurs|ملقحات|محققين|محققو الحملة|فريق تحقيق|فريق التحقيق|المحقق|فريف تحقيق|coll[eè]gue des vaccinateurs|فريق التحقيق", ignore_case = TRUE)))
+    result[free_text_idx, "sticker"] <- as.integer(str_detect(txt_free, regex("\\bsticker\\b|poster|affiche|ملصقات|الملصقات|الملصقات في السحات العمومية", ignore_case = TRUE)))
+    result[free_text_idx, "newspaper"] <- as.integer(str_detect(txt_free, regex("\\bnewspaper\\b|الأعلام", ignore_case = TRUE)))
+    result[free_text_idx, "teachers_student"] <- as.integer(str_detect(txt_free, regex("\\bteachers_student\\b|teachers student|[ée]cole|ecole|school|college|coll[eè]ge|cr[eè]che|creche|crech|créche|créch|les creches|la cr[eè]che|روضة|روضة الاطفال|الحضانة|حضانة|حضانة الاطفال|دور الحضانة|المدرسة|مدرسة|قسم التحضيري|في قسم تحضيري|التحضيري|تلاميذ المتوسطة|معلمة|المعلمة|معلمة المدرسة|معلمة الحضانه|معلمة ابنها في الروضة|اطفال اخبرو اولياءهم|أطفال اخبرو اولياءهم|اشخاص لقحوا أبنائهم", ignore_case = TRUE)))
+    result[free_text_idx, "iec_materials"] <- as.integer(str_detect(txt_free, regex("\\biec_materials\\b|iec materials|محاضرات|أنشطة ثقافية صحية|التطعيم|الحملات التحسيسية", ignore_case = TRUE)))
+  }
+  
+  # Return as tibble
+  tibble(
+    sm_info_tv_text = result[, "tv"],
+    sm_info_radio_text = result[, "radio"],
+    sm_info_others_text = result[, "others"],
+    sm_info_hworker_text = result[, "hworker"],
+    sm_info_mob_vanpa_text = result[, "mob_vanpa"],
+    sm_info_town_crier_text = result[, "town_crier"],
+    sm_info_volunteers_text = result[, "volunteers"],
+    sm_info_com_infocentre_text = result[, "com_infocentre"],
+    sm_info_community_leader_text = result[, "community_leader"],
+    sm_info_religious_leader_text = result[, "religious_leader"],
+    sm_info_mobile_social_media_text = result[, "mobile_social_media"],
+    sm_info_h2h_mobilizer_text = result[, "h2h_mobilizer"],
+    sm_info_mourchidate_text = result[, "mourchidate"],
+    sm_info_mosque_text = result[, "mosque"],
+    sm_info_vaccinators_text = result[, "vaccinators"],
+    sm_info_sticker_text = result[, "sticker"],
+    sm_info_newspaper_text = result[, "newspaper"],
+    sm_info_teachers_student_text = result[, "teachers_student"],
+    sm_info_iec_materials_text = result[, "iec_materials"]
+  )
+}
+
+coalesce_max <- function(...) {
+  vals <- list(...)
+  vals <- vals[!vapply(vals, is.null, logical(1))]
+  if (length(vals) == 0) return(NULL)
+  do.call(pmax, c(vals, na.rm = TRUE))
+}
+
+# ============================================================
+# INPUT READER - FIXED FOR QS FILES WITH .RDS EXTENSION
+# ============================================================
+read_input_data <- function(input_file) {
+  ext <- tolower(tools::file_ext(input_file))
+  
+  message("Reading file: ", basename(input_file), " [.", ext, "]")
+  
+  if (ext == "csv") {
+    return(readr::read_csv(input_file, show_col_types = FALSE) %>% as_tibble())
+  }
+  
+  if (ext %in% c("xlsx", "xls")) {
+    return(readxl::read_excel(input_file) %>% as_tibble())
+  }
+  
+  if (ext == "parquet") {
+    return(arrow::read_parquet(input_file) %>% as_tibble())
+  }
+  
+  if (ext == "qs") {
+    return(qs::qread(input_file) %>% as_tibble())
+  }
+  
+  if (ext == "rds") {
+    # First try qs::qread (files may be QS format with .rds extension)
+    obj <- tryCatch({
+      qs::qread(input_file)
+    }, error = function(e) {
+      return(NULL)
+    })
+    
+    if (is.null(obj)) {
+      obj <- tryCatch({
+        readRDS(input_file)
+      }, error = function(e) {
+        stop("Cannot read file: ", basename(input_file), " - not valid QS or RDS format")
+      })
+    }
+    
+    return(as_tibble(obj))
+  }
+  
+  stop("Unsupported file extension: ", ext, " for file: ", input_file)
+}
+
+# ============================================================
+# STANDARD COLUMN DEFINITIONS
+# ============================================================
+required_columns <- c(
+  "Country", "Region", "District", "Response", "roundNumber",
+  "Type_Monitoring", "date_monitored", "HH_count", "Total_U5_Present",
+  "TotalFM", "sum_missed_children", "Total_Absent", "Total_refusal"
+)
+
+hh_patterns_standard <- c(
+  "Total_U5_Present_HH", "U5_Vac_FM_HH", "Tot_child_Absent_HH",
+  "Tot_child_NC_HH", "Tot_child_NotVisited_HH", "Tot_child_NotRevisited",
+  "Tot_child_Asleep_HH", "Tot_child_VaccinatedRoutine", "Tot_child_Others_HH",
+  "Parent_Caregive_Inform_HH"
+)
+
+hh_patterns_algeria <- c(
+  "Total_U6_Present_HH", "U6_Vac_FM_HH", "Tot_child_Absent_HH",
+  "Tot_child_NC_HH", "Tot_child_NotVisited_HH", "Tot_child_NotRevisited",
+  "Tot_child_Asleep_HH", "Tot_child_VaccinatedRoutine", "Tot_child_Others_HH",
+  "Parent_Caregive_Inform_HH"
+)
+
+absence_total_candidates <- list(
+  r_abs_play_areas    = c("Tot_child_Abs_Play_areas_T"),
+  r_abs_market        = c("Tot_child_Abs_Market_T"),
+  r_abs_school        = c("Tot_child_Abs_School_T"),
+  r_abs_farm          = c("Tot_child_Abs_Farm_T"),
+  r_abs_social_event  = c("Tot_child_Abs_SocialEvent"),
+  r_abs_travelling    = c("Sum_child_Abs_Travelling"),
+  r_abs_parent_absent = c("Sum_child_Abs_Parent_Absent"),
+  r_abs_other_detail  = c("Tot_child_Abs_Other_T")
+)
+
+nc_total_candidates <- list(
+  r_nc_religious_beliefs = c("Tot_child_NC_Religious_beliefs_T"),
+  r_nc_side_effects      = c("Tot_child_NC_sideEffects"),
+  r_nc_too_many_doses    = c("Sum_Too_many_doses"),
+  r_nc_child_sick        = c("Sum_Child_sick", "Tot_child_NC_ChildSick_T"),
+  r_nc_covid             = c("Sum_NC_COVID"),
+  r_nc_other_detail      = c("Sum_NC_Others", "Tot_child_NC_Others_T")
+)
+
+algeria_abs_hh_patterns <- list(
+  r_abs_sick_hh       = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Sick$",
+  r_abs_school_hh     = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_School$",
+  r_abs_play_hh       = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Play_areas$",
+  r_abs_social_hh     = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Social_event$",
+  r_abs_travel_hh     = "^HH\\[[0-9]+\\]/group2/Tot_child_Abs_Travelling$",
+  r_abs_other_hh      = "^HH\\[[0-9]+\\]/group2/Other_Reason_Absent$"
+)
+
+algeria_nc_hh_patterns <- list(
+  r_nc_child_sick_hh  = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_Child_was_sick$",
+  r_nc_not_decided_hh = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_pas_decide$",
+  r_nc_polio_free_hh  = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_PolioFree$",
+  r_nc_nopv_hh        = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_nOPV$",
+  r_nc_other_hh       = "^HH\\[[0-9]+\\]/group4/Tot_child_NC_Other$"
+)
+
+# ============================================================
+# SOCIAL MOBILIZATION / SOURCE OF INFORMATION CANDIDATES
+# ============================================================
+sm_count_candidates <- list(
+  sm_info_tv                    = c("SourceInfo_TV_count"),
+  sm_info_radio                 = c("SourceInfo_Radio_count"),
+  sm_info_others                = c("SourceInfo_Others_count"),
+  sm_info_hworker               = c("SourceInfo_Hworker_count"),
+  sm_info_mob_vanpa             = c("SourceInfo_Mob_VanPA_count"),
+  sm_info_town_crier            = c("SourceInfo_Town_Crier_count"),
+  sm_info_volunteers            = c("SourceInfo_Volunteers_count"),
+  sm_info_com_infocentre        = c("SourceInfo_Com_Infocentre_count"),
+  sm_info_community_leader      = c("SourceInfo_Community_leader_count"),
+  sm_info_religious_leader      = c("SourceInfo_Religious_leader_count"),
+  sm_info_mobile_social_media   = c("SourceInfo_MobileMessaging_SocialMedia_count")
+)
+
+standard_sm_hh_patterns <- list(
+  sm_info_tv_hh                  = "^HH\\[[0-9]+\\]/HH/SourceInfo_TV$",
+  sm_info_radio_hh               = "^HH\\[[0-9]+\\]/HH/SourceInfo_Radio$",
+  sm_info_others_hh              = "^HH\\[[0-9]+\\]/HH/SourceInfo_Others$",
+  sm_info_hworker_hh             = "^HH\\[[0-9]+\\]/HH/SourceInfo_Hworker$",
+  sm_info_mob_vanpa_hh           = "^HH\\[[0-9]+\\]/HH/SourceInfo_Mob_VanPA$",
+  sm_info_town_crier_hh          = "^HH\\[[0-9]+\\]/HH/SourceInfo_Town_Crier$",
+  sm_info_volunteers_hh          = "^HH\\[[0-9]+\\]/HH/SourceInfo_Volunteers$",
+  sm_info_com_infocentre_hh      = "^HH\\[[0-9]+\\]/HH/SourceInfo_Com_Infocentre$",
+  sm_info_community_leader_hh    = "^HH\\[[0-9]+\\]/HH/SourceInfo_Community_leader$",
+  sm_info_religious_leader_hh    = "^HH\\[[0-9]+\\]/HH/SourceInfo_Religious_leader$",
+  sm_info_mobile_social_media_hh = "^HH\\[[0-9]+\\]/HH/SourceInfo_MobileMessaging_SocialMedia$",
+  sm_info_other_text_hh          = "^HH\\[[0-9]+\\]/HH/Other_Source_Info$"
+)
+
+algeria_sm_hh_patterns <- list(
+  sm_info_radio_hh         = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Radio$",
+  sm_info_mourchidate_hh   = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Mourchidate$",
+  sm_info_mosque_hh        = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Mosque$",
+  sm_info_vaccinators_hh   = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Vaccinators$",
+  sm_info_h2h_mobilizer_hh = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/H2H_Mobilizer$",
+  sm_info_sticker_hh       = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Sticker$",
+  sm_info_others_hh        = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH/Others$",
+  sm_info_other_text_hh    = "^HH\\[[0-9]+\\]/Other_Source_Info$"
+)
+
+sm_text_patterns <- list(
+  sm_source_text_hh  = "^HH\\[[0-9]+\\]/HH/Source_Info_SIA_HH$",
+  sm_other_text_hh   = "^HH\\[[0-9]+\\]/HH/Other_Source_Info$",
+  sm_source_text_alg = "^HH\\[[0-9]+\\]/Source_Info_SIA_HH$",
+  sm_other_text_alg  = "^HH\\[[0-9]+\\]/Other_Source_Info$"
+)
+
+# ============================================================
+# PREPAREDNESS LOOKUP
+# ============================================================
+load_preparedness_lookup <- function(preparedness_file) {
+  date <- read_excel(preparedness_file)
+  
+  date <- date %>%
+    mutate(`Round Number` = case_when(
+      `Round Number` == "Round 0" ~ "Rnd0",
+      `Round Number` == "Round 1" ~ "Rnd1",
+      `Round Number` == "Round 2" ~ "Rnd2",
+      `Round Number` == "Round 3" ~ "Rnd3",
+      `Round Number` == "Round 4" ~ "Rnd4",
+      `Round Number` == "Round 5" ~ "Rnd5",
+      `Round Number` == "Round 6" ~ "Rnd6",
+      TRUE ~ `Round Number`
+    ))
+  
+  prep_data <- date %>%
+    rename(
+      Response = `OBR Name`,
+      Vaccine.type = Vaccines,
+      roundNumber = `Round Number`
+    ) %>%
+    mutate(
+      round_start_date = as_date(`Round Start Date`),
+      round_start_date = case_when(
+        Country == "ALGERIA" & Response == "ALG-2024-01-01_nOPV" & roundNumber == "Rnd1" ~ as_date("2024-02-18"),
+        TRUE ~ round_start_date
+      ),
+      start_date = round_start_date + 4,
+      end_date = as_date(start_date) + 1
+    ) %>%
+    select(Response, Vaccine.type, roundNumber, round_start_date, start_date, end_date)
+  
+  as_tibble(prep_data) %>%
+    mutate(
+      start_date = as_date(start_date),
+      end_date = as_date(end_date),
+      round_start_date = as_date(round_start_date)
+    )
+}
+
+lookup_table <- load_preparedness_lookup(preparedness_file)
+
+# ============================================================
+# TRANSFORMATION FUNCTIONS
+# ============================================================
+apply_country_specific_transformations <- function(data, file_name) {
+  if (startsWith(file_name, "3550") || startsWith(file_name, "3583")) {
+    data <- data %>% mutate(Country = "GHA")
+  }
+  
+  if (startsWith(file_name, "8834")) {
+    data <- data %>% mutate(Region = District)
+  }
+  
+  if (startsWith(file_name, "4351")) {
+    if ("district" %in% names(data)) {
+      data <- data %>% mutate(District = district)
+    }
+  }
+  
+  data
+}
+
+select_columns_dynamically <- function(df, required_cols, hh_patterns, hh_count = 10) {
+  selected_cols <- c()
+  
+  for (col in required_cols) {
+    matched_col <- find_similar_column(col, df)
+    if (!is.na(matched_col)) selected_cols <- c(selected_cols, matched_col)
+  }
+  
+  for (hh_num in 1:hh_count) {
+    for (pattern in hh_patterns) {
+      candidates <- build_hh_candidate_names(hh_num, pattern)
+      for (cand in candidates) {
+        matched_col <- find_similar_column(cand, df, exact_first = TRUE)
+        if (!is.na(matched_col)) {
+          selected_cols <- c(selected_cols, matched_col)
+          break
+        }
+      }
+    }
+  }
+  
+  detailed_cols <- unique(c(
+    unlist(absence_total_candidates),
+    unlist(nc_total_candidates),
+    unlist(sm_count_candidates),
+    "Tot_child_NC_NotDecide_T",
+    "Tot_child_NC_PolioFREE_T",
+    "Tot_child_NC_nOPV_T",
+    "Tot_child_NC_ChildSick_T",
+    "Tot_child_NC_Others_T",
+    "Tot_child_Abs_Sick_T"
+  ))
+  
+  selected_cols <- unique(c(selected_cols, intersect(detailed_cols, names(df))))
+  
+  for (p in c(
+    unlist(algeria_abs_hh_patterns),
+    unlist(algeria_nc_hh_patterns),
+    unlist(algeria_sm_hh_patterns),
+    unlist(standard_sm_hh_patterns),
+    unlist(sm_text_patterns)
+  )) {
+    selected_cols <- unique(c(selected_cols, grep(p, names(df), value = TRUE)))
+  }
+  
+  unique(selected_cols)
+}
+
+safe_filter_data <- function(df) {
+  result <- df
+  
+  if ("Type_Monitoring" %in% names(result)) {
+    result <- result %>% filter(Type_Monitoring == "EndProcess")
+  }
+  
+  if ("Response" %in% names(result)) {
+    result <- result %>% filter(!is.na(Response), Response != "", Response != "n/a", Response != "NA")
+  }
+  
+  if ("roundNumber" %in% names(result)) {
+    result <- result %>% filter(!is.na(roundNumber), roundNumber != "", roundNumber != "n/a", roundNumber != "NA")
+  }
+  
+  if ("Total_U5_Present" %in% names(result)) {
+    result <- result %>% filter(is.na(Total_U5_Present) | Total_U5_Present != "n/a")
+  }
+  
+  if ("TotalFM" %in% names(result)) {
+    result <- result %>% filter(!is.na(TotalFM))
+  }
+  
+  result
+}
+
+standardize_districts <- function(df) {
+  needed <- c("Country", "Region", "District")
+  if (!all(needed %in% names(df))) {
+    return(df)
+  }
+  
+  df %>%
+    mutate(District = case_when(
+      Country == "COTE D'IVOIRE" & Region == "MORONOU" & District == "MBATTO" ~ "MBATTO",
+      Country == "COTE D'IVOIRE" & Region == "MORONOU" & District == "M'BATTO" ~ "MBATTO",
+      Country == "COTE D'IVOIRE" & Region == "ABIDJAN1" & District == "ABOBO_EST" ~ "ABOBO EST",
+      Country == "COTE D'IVOIRE" & Region == "ABIDJAN1" & District == "ABOBO_OUEST" ~ "ABOBO OUEST",
+      Country == "CHAD" & Region == "BATHA" & District == "OUM_HADJER" ~ "OUM_HADJER",
+      Country == "CHAD" & Region == "BATHA" & District == "OUM HADJER" ~ "OUM_HADJER",
+      Country == "CHAD" & Region == "NDJAMENA" & District == "NDJAMENA_SUD" ~ "N'DJAMENA-SUD",
+      Country == "CHAD" & Region == "NDJAMENA" & District == "NDJAMENA_NORD" ~ "N'DJAMENA-NORD",
+      Country == "BENIN" & Region == "LITTORAL" & District == "COTONOU 1" ~ "COTONOU 1",
+      Country == "BENIN" & Region == "LITTORAL" & District == "Cotonou I" ~ "COTONOU 1",
+      TRUE ~ District
+    ))
+}
+
+standardize_responses <- function(df) {
+  needed <- c("Country", "Response")
+  if (!all(needed %in% names(df))) {
+    return(df)
+  }
+  
+  df %>%
+    mutate(Response = case_when(
+      Country == "COTE D'IVOIRE" & str_detect(Response, "ABENGOUROU|ABOBO_EST|ABOBO_OUEST|ABOISSO") ~ "CIV-113DS-09-2020",
+      Country == "MAL" & str_detect(Response, "Arfounda|BAMAKO|Banamba|Nara") ~ "MLI-12DS-01-2021",
+      TRUE ~ Response
+    ))
+}
+
+assign_vaccine_types <- function(df) {
+  if (!all(c("Country", "Response", "roundNumber") %in% names(df))) {
+    return(df)
+  }
+  
+  df %>%
+    mutate(
+      roundNumber = toupper(roundNumber),
+      roundNumber = case_when(
+        str_detect(roundNumber, "0") ~ "Rnd0",
+        str_detect(roundNumber, "1") ~ "Rnd1",
+        str_detect(roundNumber, "2") ~ "Rnd2",
+        str_detect(roundNumber, "3") ~ "Rnd3",
+        str_detect(roundNumber, "4") ~ "Rnd4",
+        str_detect(roundNumber, "5") ~ "Rnd5",
+        str_detect(roundNumber, "6") ~ "Rnd6",
+        TRUE ~ roundNumber
+      )
+    ) %>%
+    mutate(
+      Vaccine.type = case_when(
+        Country == "BENIN" & Response == "KETOU" ~ "mOPV",
+        Country == "COG" & Response == "Congo" ~ "nOPV",
+        Country == "GUI" & Response == "Conakry" ~ "mOPV",
+        Country == "COTE D'IVOIRE" & Response == "CIV-113DS-09-2020" ~ "mOPV",
+        Country == "MAL" & Response == "MLI-12DS-01-2021" ~ "mOPV",
+        str_detect(Response, "CHD-2025-10-0n_bOPV-NIDs|GUI-2025-01-NID_bOPV-nOPV") ~ "nOPV2 & bOPV",
+        str_detect(Response, "BITTOU|MENAKA-mOPV2|BAMAKO-mOPV2|KANKAN-mOPV|MLI-12DS-01-2021-mOPV2|CONAKRY-mOPV|Ouagadogou|Bangui 1|GOTHEY|YOPOUGON|Golfe|MDG-2023-03-01_bOPV|BEN-xxDS-02-2020|BEN-26DS-08-2020|Chavuma-mOPV|Luapula-mOPV") ~ "mOPV",
+        str_detect(Response, "nOPV|VPOn|TSHUAPA|Tanganyika|Liberia|Mauritania|KOUIBLY|Sierra Leone|SEN|CEN|MAL|BEN-39DS-01-2021|BERTOUA|EBOLOWA|EXNORD|ExtNord2023|ADDIS ABABA|Mekelle|AMANSIE SOUTH|CAF-2020-002|CENBLOCK|CENTRALBLK|CHA-17DS-02-2020|DONOMANGA|GNBnOPV|GOLFE|GOTHEYE|KEN-13DS-02-2021|MopUp2022|SSD-79DS-09-2020|ALG-2023-09-01_nOPV|ALG-2024-01-01_nOPV|nOPV2022|BEN-2023-09-01_nOPV|BFA-2023-05-01_nOPV|BFA-2023-09-01_nOPV|BFA-2024-02-01_nOPV|BITTOU-mOPV2|Ouagadogou-mOPV2|BOT-2023-02-01_nOPV|CAM-2023-05-01_nOPV|CAM-2023-08-01_nOPV|CAM-2024-02-01_nOPV|nOPV2023|nVPO|nVPO_Maradi|nVPO_Zinder|nVPO2|May2021|OPVb2021|OPVb2022|RSSmOPV10C2021|SEN_VPOn|UGAnOPV|VPOb|VPOb13ProV") ~ "nOPV2",
+        str_detect(Response, "BOPV|bOPV|OPVb|WPV1") ~ "bOPV",
+        str_detect(Response, "mOPV") ~ "mOPV",
+        str_detect(Response, "OPV") & !str_detect(Response, "nOPV|bOPV|mOPV") ~ "bOPV",
+        TRUE ~ "other"
+      ),
+      Response = case_when(
+        Response == "nOPV2022" & Country == "GHA" ~ "nOPV2022",
+        Response == "CENTRALBLK" ~ "DRC-7DS-02-2022",
+        Response == "nOPV2022" & Country == "RDC" ~ "DRC-39DS-01-2021",
+        Response %in% c("Tshuapa", "TSHUAPA") ~ "DRC-23DS-12-2020",
+        Response == "VPOb13ProV" ~ "DRC-39DS-01-2021",
+        TRUE ~ Response
+      )
+    ) %>%
+    mutate(
+      Vaccine.type = case_when(
+        Response == "DRC-2025-02-01_nOPV_sNID" &
+          roundNumber == "Rnd1" &
+          Region %in% c("HAUT KATANGA", "HAUT LOMAMI", "TANGANIKA", "KINSHASA") ~ "nOPV2",
+        Response == "DRC-2025-02-01_nOPV_sNID" &
+          roundNumber == "Rnd1" &
+          Region == "TSHOPO" &
+          District %in% c("ALUNGULI", "FEREKENI", "KAILO", "LUBUTU", "OBOKOTE", "OPIENGE") ~ "bOPV",
+        TRUE ~ Vaccine.type
+      )
+    )
+}
+
+create_summary_columns <- function(df, file_name) {
+  is_algeria_8587 <- identical(file_name, ALGERIA_IM_FORM_ID)
+  
+  if (is_algeria_8587) {
+    present_cols <- names(df)[names(df) %in% sprintf("HH[%s]/Total_U6_Present_HH", 1:10)]
+    fm_cols <- names(df)[names(df) %in% sprintf("HH[%s]/U6_Vac_FM_HH", 1:10)]
+  } else {
+    present_cols <- names(df)[names(df) %in% sprintf("HH[%s]/Total_U5_Present_HH", 1:10)]
+    fm_cols <- names(df)[names(df) %in% sprintf("HH[%s]/U5_Vac_FM_HH", 1:10)]
+  }
+  
+  abs_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_Absent_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_Absent_HH$")
+  ))
+  
+  nc_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_NC_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_NC_HH$")
+  ))
+  
+  notvisited_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_NotVisited_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_NotVisited_HH$")
+  ))
+  
+  notrevisited_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_NotRevisited$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_NotRevisited$")
+  ))
+  
+  asleep_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_Asleep_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_Asleep_HH$")
+  ))
+  
+  routine_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_VaccinatedRoutine$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_VaccinatedRoutine$")
+  ))
+  
+  other_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Tot_child_Others_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Tot_child_Others_HH$")
+  ))
+  
+  caregiver_cols <- unique(c(
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/group1/Parent_Caregive_Inform_HH$"),
+    get_regex_cols(df, "^HH\\[[0-9]+\\]/Parent_Caregive_Inform_HH$")
+  ))
+  
+  abs_sick_hh_cols   <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_sick_hh)
+  abs_school_hh_cols <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_school_hh)
+  abs_play_hh_cols   <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_play_hh)
+  abs_social_hh_cols <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_social_hh)
+  abs_travel_hh_cols <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_travel_hh)
+  abs_other_hh_cols  <- get_regex_cols(df, algeria_abs_hh_patterns$r_abs_other_hh)
+  
+  nc_childsick_hh_cols <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_child_sick_hh)
+  nc_notdecide_hh_cols <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_not_decided_hh)
+  nc_poliofree_hh_cols <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_polio_free_hh)
+  nc_nopv_hh_cols      <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_nopv_hh)
+  nc_other_hh_cols     <- get_regex_cols(df, algeria_nc_hh_patterns$r_nc_other_hh)
+  
+  sm_tv_hh_cols                  <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_tv_hh)
+  sm_radio_hh_cols               <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_radio_hh)
+  sm_others_hh_cols              <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_others_hh)
+  sm_hworker_hh_cols             <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_hworker_hh)
+  sm_mob_vanpa_hh_cols           <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_mob_vanpa_hh)
+  sm_town_crier_hh_cols          <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_town_crier_hh)
+  sm_volunteers_hh_cols          <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_volunteers_hh)
+  sm_com_infocentre_hh_cols      <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_com_infocentre_hh)
+  sm_community_leader_hh_cols    <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_community_leader_hh)
+  sm_religious_leader_hh_cols    <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_religious_leader_hh)
+  sm_mobile_social_media_hh_cols <- get_regex_cols(df, standard_sm_hh_patterns$sm_info_mobile_social_media_hh)
+  
+  sm_radio_alg_hh_cols         <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_radio_hh)
+  sm_mourchidate_hh_cols       <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_mourchidate_hh)
+  sm_mosque_hh_cols            <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_mosque_hh)
+  sm_vaccinators_hh_cols       <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_vaccinators_hh)
+  sm_h2h_mobilizer_hh_cols     <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_h2h_mobilizer_hh)
+  sm_sticker_hh_cols           <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_sticker_hh)
+  sm_others_alg_hh_cols        <- get_regex_cols(df, algeria_sm_hh_patterns$sm_info_others_hh)
+  
+  sm_text_cols <- unique(c(
+    get_regex_cols(df, sm_text_patterns$sm_source_text_hh),
+    get_regex_cols(df, sm_text_patterns$sm_other_text_hh),
+    get_regex_cols(df, sm_text_patterns$sm_source_text_alg),
+    get_regex_cols(df, sm_text_patterns$sm_other_text_alg)
+  ))
+  
+  sm_text_parsed <- extract_sm_from_text(df, sm_text_cols)
+  df2 <- bind_cols(df, sm_text_parsed)
+  
+  df2 %>%
+    mutate(
+      u5_present = safe_row_sum(., present_cols),
+      u5_FM1 = safe_row_sum(., fm_cols),
+      u5_FM = ifelse(u5_FM1 > u5_present & u5_present > 0, u5_present, u5_FM1),
+      u5_FM = ifelse(is.na(u5_FM), 0, u5_FM),
+      missed_child = pmax(0, u5_present - u5_FM),
+      
+      r_non_FM_Absent = safe_row_sum(., abs_cols),
+      r_non_FM_NC = safe_row_sum(., nc_cols),
+      r_non_FM_hh_notvisited = safe_row_sum(., notvisited_cols),
+      r_non_FM_hh_notrevisited = safe_row_sum(., notrevisited_cols),
+      r_non_FM_sleep = safe_row_sum(., asleep_cols),
+      r_non_FM_vaccinatedRoutine = safe_row_sum(., routine_cols),
+      r_non_FM_other = safe_row_sum(., other_cols),
+      care_Giver_Informed_SIA = safe_row_sum(., caregiver_cols),
+      
+      r_abs_play_areas = safe_pick_first(., absence_total_candidates$r_abs_play_areas),
+      r_abs_market = safe_pick_first(., absence_total_candidates$r_abs_market),
+      r_abs_school = safe_pick_first(., absence_total_candidates$r_abs_school),
+      r_abs_farm = safe_pick_first(., absence_total_candidates$r_abs_farm),
+      r_abs_social_event = safe_pick_first(., absence_total_candidates$r_abs_social_event),
+      r_abs_travelling = safe_pick_first(., absence_total_candidates$r_abs_travelling),
+      r_abs_parent_absent = safe_pick_first(., absence_total_candidates$r_abs_parent_absent),
+      r_abs_other_detail_form = safe_pick_first(., absence_total_candidates$r_abs_other_detail),
+      
+      r_abs_sick = safe_row_sum(., abs_sick_hh_cols),
+      r_abs_school_hh = safe_row_sum(., abs_school_hh_cols),
+      r_abs_play_hh = safe_row_sum(., abs_play_hh_cols),
+      r_abs_social_hh = safe_row_sum(., abs_social_hh_cols),
+      r_abs_travel_hh = safe_row_sum(., abs_travel_hh_cols),
+      r_abs_other_hh = safe_row_sum(., abs_other_hh_cols),
+      
+      r_nc_religious_beliefs = safe_pick_first(., nc_total_candidates$r_nc_religious_beliefs),
+      r_nc_side_effects = safe_pick_first(., nc_total_candidates$r_nc_side_effects),
+      r_nc_too_many_doses = safe_pick_first(., nc_total_candidates$r_nc_too_many_doses),
+      r_nc_child_sick_form = safe_pick_first(., nc_total_candidates$r_nc_child_sick),
+      r_nc_covid = safe_pick_first(., nc_total_candidates$r_nc_covid),
+      r_nc_other_detail_form = safe_pick_first(., nc_total_candidates$r_nc_other_detail),
+      
+      r_nc_child_sick_hh = safe_row_sum(., nc_childsick_hh_cols),
+      r_nc_not_decided = safe_row_sum(., nc_notdecide_hh_cols),
+      r_nc_polio_free = safe_row_sum(., nc_poliofree_hh_cols),
+      r_nc_nopv = safe_row_sum(., nc_nopv_hh_cols),
+      r_nc_other_hh = safe_row_sum(., nc_other_hh_cols),
+      
+      sm_info_tv_count                  = safe_pick_first(., sm_count_candidates$sm_info_tv),
+      sm_info_radio_count               = safe_pick_first(., sm_count_candidates$sm_info_radio),
+      sm_info_others_count              = safe_pick_first(., sm_count_candidates$sm_info_others),
+      sm_info_hworker_count             = safe_pick_first(., sm_count_candidates$sm_info_hworker),
+      sm_info_mob_vanpa_count           = safe_pick_first(., sm_count_candidates$sm_info_mob_vanpa),
+      sm_info_town_crier_count          = safe_pick_first(., sm_count_candidates$sm_info_town_crier),
+      sm_info_volunteers_count          = safe_pick_first(., sm_count_candidates$sm_info_volunteers),
+      sm_info_com_infocentre_count      = safe_pick_first(., sm_count_candidates$sm_info_com_infocentre),
+      sm_info_community_leader_count    = safe_pick_first(., sm_count_candidates$sm_info_community_leader),
+      sm_info_religious_leader_count    = safe_pick_first(., sm_count_candidates$sm_info_religious_leader),
+      sm_info_mobile_social_media_count = safe_pick_first(., sm_count_candidates$sm_info_mobile_social_media),
+      
+      sm_info_tv_hh                  = safe_row_sum(., sm_tv_hh_cols),
+      sm_info_radio_hh               = safe_row_sum(., sm_radio_hh_cols),
+      sm_info_others_hh              = safe_row_sum(., sm_others_hh_cols),
+      sm_info_hworker_hh             = safe_row_sum(., sm_hworker_hh_cols),
+      sm_info_mob_vanpa_hh           = safe_row_sum(., sm_mob_vanpa_hh_cols),
+      sm_info_town_crier_hh          = safe_row_sum(., sm_town_crier_hh_cols),
+      sm_info_volunteers_hh          = safe_row_sum(., sm_volunteers_hh_cols),
+      sm_info_com_infocentre_hh      = safe_row_sum(., sm_com_infocentre_hh_cols),
+      sm_info_community_leader_hh    = safe_row_sum(., sm_community_leader_hh_cols),
+      sm_info_religious_leader_hh    = safe_row_sum(., sm_religious_leader_hh_cols),
+      sm_info_mobile_social_media_hh = safe_row_sum(., sm_mobile_social_media_hh_cols),
+      
+      sm_info_radio_alg_hh         = safe_row_sum(., sm_radio_alg_hh_cols),
+      sm_info_mourchidate_hh       = safe_row_sum(., sm_mourchidate_hh_cols),
+      sm_info_mosque_hh            = safe_row_sum(., sm_mosque_hh_cols),
+      sm_info_vaccinators_hh       = safe_row_sum(., sm_vaccinators_hh_cols),
+      sm_info_h2h_mobilizer_hh     = safe_row_sum(., sm_h2h_mobilizer_hh_cols),
+      sm_info_sticker_hh           = safe_row_sum(., sm_sticker_hh_cols),
+      sm_info_others_alg_hh        = safe_row_sum(., sm_others_alg_hh_cols)
+    ) %>%
+    mutate(
+      r_abs_other_detail = pmax(r_abs_other_detail_form, r_abs_other_hh, na.rm = TRUE),
+      r_abs_school = pmax(r_abs_school, r_abs_school_hh, na.rm = TRUE),
+      r_abs_play_areas = pmax(r_abs_play_areas, r_abs_play_hh, na.rm = TRUE),
+      r_abs_social_event = pmax(r_abs_social_event, r_abs_social_hh, na.rm = TRUE),
+      r_abs_travelling = pmax(r_abs_travelling, r_abs_travel_hh, na.rm = TRUE),
+      
+      r_nc_child_sick = pmax(r_nc_child_sick_form, r_nc_child_sick_hh, na.rm = TRUE),
+      r_nc_other_detail = pmax(r_nc_other_detail_form, r_nc_other_hh, na.rm = TRUE),
+      
+      sm_info_tv = coalesce_max(sm_info_tv_count, sm_info_tv_hh, sm_info_tv_text),
+      sm_info_radio = coalesce_max(sm_info_radio_count, sm_info_radio_hh, sm_info_radio_alg_hh, sm_info_radio_text),
+      sm_info_others = coalesce_max(sm_info_others_count, sm_info_others_hh, sm_info_others_alg_hh, sm_info_others_text),
+      sm_info_hworker = coalesce_max(sm_info_hworker_count, sm_info_hworker_hh, sm_info_hworker_text),
+      sm_info_mob_vanpa = coalesce_max(sm_info_mob_vanpa_count, sm_info_mob_vanpa_hh, sm_info_mob_vanpa_text),
+      sm_info_town_crier = coalesce_max(sm_info_town_crier_count, sm_info_town_crier_hh, sm_info_town_crier_text),
+      sm_info_volunteers = coalesce_max(sm_info_volunteers_count, sm_info_volunteers_hh, sm_info_volunteers_text),
+      sm_info_com_infocentre = coalesce_max(sm_info_com_infocentre_count, sm_info_com_infocentre_hh, sm_info_com_infocentre_text),
+      sm_info_community_leader = coalesce_max(sm_info_community_leader_count, sm_info_community_leader_hh, sm_info_community_leader_text),
+      sm_info_religious_leader = coalesce_max(sm_info_religious_leader_count, sm_info_religious_leader_hh, sm_info_religious_leader_text),
+      sm_info_mobile_social_media = coalesce_max(sm_info_mobile_social_media_count, sm_info_mobile_social_media_hh, sm_info_mobile_social_media_text),
+      
+      sm_info_h2h_mobilizer = coalesce_max(sm_info_h2h_mobilizer_hh, sm_info_h2h_mobilizer_text),
+      sm_info_mourchidate = coalesce_max(sm_info_mourchidate_hh, sm_info_mourchidate_text),
+      sm_info_mosque = coalesce_max(sm_info_mosque_hh, sm_info_mosque_text),
+      sm_info_vaccinators = coalesce_max(sm_info_vaccinators_hh, sm_info_vaccinators_text),
+      sm_info_sticker = coalesce_max(sm_info_sticker_hh, sm_info_sticker_text),
+      
+      sm_total_sources =
+        sm_info_tv + sm_info_radio + sm_info_others + sm_info_hworker +
+        sm_info_mob_vanpa + sm_info_town_crier + sm_info_volunteers +
+        sm_info_com_infocentre + sm_info_community_leader +
+        sm_info_religious_leader + sm_info_mobile_social_media +
+        sm_info_h2h_mobilizer + sm_info_mourchidate + sm_info_mosque +
+        sm_info_vaccinators + sm_info_sticker +
+        sm_info_newspaper_text + sm_info_teachers_student_text + sm_info_iec_materials_text,
+      
+      abs_detail_total =
+        r_abs_sick + r_abs_play_areas + r_abs_market + r_abs_school +
+        r_abs_farm + r_abs_social_event + r_abs_travelling +
+        r_abs_parent_absent + r_abs_other_detail,
+      
+      nc_detail_total =
+        r_nc_religious_beliefs + r_nc_side_effects + r_nc_too_many_doses +
+        r_nc_child_sick + r_nc_covid + r_nc_other_detail +
+        r_nc_not_decided + r_nc_polio_free + r_nc_nopv
+    )
+}
+
+process_final_data <- function(df) {
+  # ------------------------------------------------------------
+  # Harmonized with Nigeria IM builder:
+  # - keeps Regional IM QC logic
+  # - adds Nigeria-compatible SM indicators
+  # - creates Nigeria SM codebook columns as 0 for Regional rows
+  # ------------------------------------------------------------
+  regional_sm_vars <- c(
+    "sm_info_tv", "sm_info_radio", "sm_info_others", "sm_info_hworker",
+    "sm_info_mob_vanpa", "sm_info_town_crier", "sm_info_volunteers",
+    "sm_info_com_infocentre", "sm_info_community_leader",
+    "sm_info_religious_leader", "sm_info_mobile_social_media",
+    "sm_info_mourchidate", "sm_info_mosque", "sm_info_vaccinators",
+    "sm_info_h2h_mobilizer", "sm_info_sticker",
+    "sm_info_newspaper_text", "sm_info_teachers_student_text",
+    "sm_info_iec_materials_text"
+  )
+
+  nigeria_sm_vars <- c(
+    "sm_traditional_leader", "sm_town_announcer", "sm_mosque_announcement",
+    "sm_radio", "sm_newspaper", "sm_poster_leaflets", "sm_banner_hoarding",
+    "sm_relative_neighbour_friend", "sm_health_worker", "sm_vcm_unicef",
+    "sm_school_children_rally_visit", "sm_not_aware", "sm_other"
+  )
+
+  missing_numeric <- setdiff(c(regional_sm_vars, nigeria_sm_vars), names(df))
+  for (cc in missing_numeric) df[[cc]] <- 0
+
+  for (cc in c(regional_sm_vars, nigeria_sm_vars)) {
+    df[[cc]] <- suppressWarnings(as.numeric(df[[cc]]))
+    df[[cc]][is.na(df[[cc]])] <- 0
+  }
+
+  df %>%
+    mutate(
+      Country = case_when(
+        Country == "DRC" ~ "RDC",
+        Country == "Camerooun" ~ "CAE",
+        Country == "BURKINA_FASO" ~ "BFA",
+        Country == "CAMEROON" ~ "CAE",
+        Country == "CHAD" ~ "CHD",
+        TRUE ~ Country
+      ),
+      roundNumber = case_when(
+        roundNumber == "RND2" ~ "Rnd2",
+        TRUE ~ roundNumber
+      ),
+
+      reasons_total =
+        r_non_FM_Absent +
+        r_non_FM_NC +
+        r_non_FM_hh_notvisited +
+        r_non_FM_hh_notrevisited +
+        r_non_FM_sleep +
+        r_non_FM_vaccinatedRoutine +
+        r_non_FM_other,
+
+      check_missed = missed_child - reasons_total,
+      unexplained_missed = pmax(check_missed, 0),
+      overreported_reasons = pmax(-check_missed, 0),
+      explained_ratio = ifelse(missed_child > 0, round(reasons_total / missed_child, 3), NA_real_),
+      unexplained_ratio = ifelse(missed_child > 0, round(unexplained_missed / missed_child, 3), NA_real_),
+
+      check_abs_detail = r_non_FM_Absent - abs_detail_total,
+      check_nc_detail = r_non_FM_NC - nc_detail_total,
+
+      check_sm_info = care_Giver_Informed_SIA - sm_total_sources,
+      sm_info_gap = pmax(check_sm_info, 0),
+      sm_info_overlap = pmax(-check_sm_info, 0),
+
+      sm_total_awareness_sources = pmax(sm_total_sources - sm_not_aware, 0),
+
+      reconciliation_flag = case_when(
+        check_missed == 0 ~ "Consistent",
+        check_missed > 0 & reasons_total == 0 ~ "No reasons recorded",
+        check_missed > 0 ~ "Partial reasons recorded",
+        check_missed < 0 ~ "Overlapping reasons",
+        TRUE ~ "Unknown"
+      ),
+
+      abs_detail_flag = case_when(
+        check_abs_detail == 0 ~ "Abs detail consistent",
+        check_abs_detail > 0 ~ "Abs detail incomplete",
+        check_abs_detail < 0 ~ "Abs detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+
+      nc_detail_flag = case_when(
+        check_nc_detail == 0 ~ "NC detail consistent",
+        check_nc_detail > 0 ~ "NC detail incomplete",
+        check_nc_detail < 0 ~ "NC detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+
+      sm_reconciliation_flag = case_when(
+        care_Giver_Informed_SIA > 0 & sm_total_sources == 0 ~ "No source recorded",
+        check_sm_info == 0 ~ "SM consistent",
+        check_sm_info < 0 ~ "Multiple sources per informed HH",
+        check_sm_info > 0 ~ "Some informed HH missing source",
+        TRUE ~ "Unknown"
+      ),
+
+      qc_flag = case_when(
+        check_missed == 0 &
+          check_abs_detail == 0 &
+          check_nc_detail == 0 &
+          check_sm_info <= 0 ~ "OK",
+        TRUE ~ "Needs review"
+      ),
+
+      sm_intensity_group = case_when(
+        sm_total_awareness_sources == 0 ~ "No awareness source",
+        sm_total_awareness_sources == 1 ~ "One awareness source",
+        sm_total_awareness_sources <= 3 ~ "2-3 awareness sources",
+        sm_total_awareness_sources >= 4 ~ "4+ awareness sources",
+        TRUE ~ "Unknown"
+      ),
+
+      sm_non_compliance_pressure = case_when(
+        sm_total_awareness_sources == 0 & r_non_FM_NC > 0 ~ "Non-compliance with no awareness source",
+        sm_total_awareness_sources > 0 & r_non_FM_NC > 0 ~ "Non-compliance despite awareness",
+        sm_total_awareness_sources > 0 & r_non_FM_NC == 0 ~ "Awareness with no non-compliance",
+        TRUE ~ "No SM / no non-compliance"
+      ),
+
+      sm_gap_flag = case_when(
+        sm_total_awareness_sources == 0 ~ "SM gap detected",
+        TRUE ~ "SM source recorded"
+      ),
+
+      technical_sm_source =
+        sm_info_hworker + sm_info_vaccinators + sm_health_worker + sm_vcm_unicef,
+
+      sm_priority_flag = case_when(
+        sm_total_awareness_sources == 0 & !is.na(cv) & cv < 0.9 ~ "High priority SM gap",
+        r_non_FM_NC > 0 & technical_sm_source == 0 ~ "Community resistance / weak technical source",
+        sm_not_aware > 0 ~ "Not aware reported",
+        TRUE ~ "No major SM alert"
+      )
+    )
+}
+
+# ============================================================
+# MAIN FILE PROCESSOR
+# ============================================================
+process_im_file <- function(input_file, output_folder, qc_output_folder, lookup_table) {
+  file_name <- tools::file_path_sans_ext(basename(input_file))
+  output_file <- file.path(output_folder, paste0(file_name, ".csv"))
+  qc_output_file <- file.path(qc_output_folder, paste0(file_name, "_QC.csv"))
+  
+  message("\n============================================================")
+  message("Processing file: ", basename(input_file))
+  message("============================================================")
+  
+  data <- read_input_data(input_file)
+  
+  minimum_im_markers <- c("Response", "roundNumber", "Type_Monitoring")
+  if (!any(minimum_im_markers %in% names(data))) {
+    stop("File does not look like an IM dataset.")
+  }
+  
+  if (!"Country" %in% names(data)) {
+    data$Country <- NA_character_
+  }
+  
+  data <- apply_country_specific_transformations(data, file_name)
+  data <- rename_repetitive_columns(data)
+  
+  active_hh_patterns <- if (identical(file_name, ALGERIA_IM_FORM_ID)) {
+    hh_patterns_algeria
+  } else {
+    hh_patterns_standard
+  }
+  
+  columns_to_select <- select_columns_dynamically(data, required_columns, active_hh_patterns)
+  
+  GF <- data %>%
+    safe_filter_data() %>%
+    select(any_of(columns_to_select))
+  
+  if (nrow(GF) == 0) {
+    message("Warning: No data after filtering. Using original data with selected columns.")
+    GF <- data %>% select(any_of(columns_to_select))
+  }
+  
+  hh_cols <- names(GF)[str_detect(names(GF), "^HH\\[")]
+  
+  sm_text_keep_cols <- hh_cols[str_detect(
+    hh_cols,
+    regex("Source_Info_SIA_HH$|Other_Source_Info$", ignore_case = TRUE)
+  )]
+  
+  hh_numeric_cols <- setdiff(hh_cols, sm_text_keep_cols)
+  
+  for (col in hh_numeric_cols) {
+    GF[[col]] <- clean_yes_no_numeric(GF[[col]])
+  }
+  
+  for (col in sm_text_keep_cols) {
+    GF[[col]] <- as.character(GF[[col]])
+  }
+  
+  numeric_cols <- intersect(
+    c(
+      "HH_count", "Total_U5_Present", "TotalFM", "sum_missed_children",
+      "Total_Absent", "Total_refusal",
+      unlist(absence_total_candidates),
+      unlist(nc_total_candidates),
+      unlist(sm_count_candidates),
+      "Tot_child_NC_NotDecide_T", "Tot_child_NC_PolioFREE_T",
+      "Tot_child_NC_nOPV_T", "Tot_child_NC_ChildSick_T",
+      "Tot_child_NC_Others_T", "Tot_child_Abs_Sick_T"
+    ),
+    names(GF)
+  )
+  
+  if (length(numeric_cols) > 0) {
+    GF[numeric_cols] <- lapply(GF[numeric_cols], clean_numeric)
+  }
+  
+  if ("date_monitored" %in% names(GF)) {
+    GF <- GF %>% mutate(date_monitored = parse_mixed_dates(date_monitored))
+  }
+  
+  GH <- create_summary_columns(GF, file_name = file_name)
+  
+  if ("HH_count" %in% names(GH)) {
+    GH <- GH %>%
+      mutate(Number_of_HH_visited = suppressWarnings(as.numeric(HH_count)))
+  } else if ("Number_of_HH_visited" %in% names(GH)) {
+    GH <- GH %>%
+      mutate(Number_of_HH_visited = suppressWarnings(as.numeric(Number_of_HH_visited)))
+  } else {
+    GH$Number_of_HH_visited <- NA_real_
+  }
+  
+  if (!"Total_U5_Present" %in% names(GH)) GH$Total_U5_Present <- NA_real_
+  if (!"TotalFM" %in% names(GH)) GH$TotalFM <- NA_real_
+  
+  GJ <- GH %>%
+    mutate(
+      Total_U5_Present = suppressWarnings(as.numeric(Total_U5_Present)),
+      TotalFM = suppressWarnings(as.numeric(TotalFM))
+    ) %>%
+    standardize_districts()
+  
+  GO <- GJ %>% standardize_responses()
+  GK <- GO %>% assign_vaccine_types()
+  GL <- GK %>% process_final_data()
+  
+  required_final_columns <- c(
+    "Country", "Region", "District", "Response", "Vaccine.type", "roundNumber",
+    "date_monitored", "Number_of_HH_visited", "u5_present", "u5_FM", "missed_child",
+    "r_non_FM_Absent", "r_non_FM_NC", "r_non_FM_hh_notvisited", "r_non_FM_hh_notrevisited",
+    "r_non_FM_sleep", "r_non_FM_vaccinatedRoutine", "r_non_FM_other",
+    "care_Giver_Informed_SIA",
+    "sm_info_tv", "sm_info_radio", "sm_info_others", "sm_info_hworker",
+    "sm_info_mob_vanpa", "sm_info_town_crier", "sm_info_volunteers",
+    "sm_info_com_infocentre", "sm_info_community_leader",
+    "sm_info_religious_leader", "sm_info_mobile_social_media",
+    "sm_info_mourchidate", "sm_info_mosque", "sm_info_vaccinators",
+    "sm_info_h2h_mobilizer", "sm_info_sticker",
+    "sm_info_newspaper_text", "sm_info_teachers_student_text", "sm_info_iec_materials_text",
+    "sm_total_sources",
+    "check_sm_info", "sm_info_gap", "sm_info_overlap", "sm_reconciliation_flag",
+    "r_abs_sick", "r_abs_play_areas", "r_abs_market", "r_abs_school",
+    "r_abs_farm", "r_abs_social_event", "r_abs_travelling", "r_abs_parent_absent", "r_abs_other_detail",
+    "r_nc_religious_beliefs", "r_nc_side_effects", "r_nc_too_many_doses",
+    "r_nc_child_sick", "r_nc_covid", "r_nc_other_detail", "r_nc_not_decided",
+    "r_nc_polio_free", "r_nc_nopv",
+    "abs_detail_total", "nc_detail_total", "reasons_total",
+    "check_missed", "check_abs_detail", "check_nc_detail",
+    "unexplained_missed", "overreported_reasons",
+    "explained_ratio", "unexplained_ratio",
+    "reconciliation_flag", "abs_detail_flag", "nc_detail_flag", "qc_flag"
+  )
+  
+  for (col in required_final_columns) {
+    if (!col %in% names(GL)) {
+      GL[[col]] <- NA
+    }
+  }
+  
+  F5 <- GL %>%
+    mutate(
+      start_date = as_date(date_monitored),
+      end_date = as_date(date_monitored),
+      year = year(start_date),
+      cv = ifelse(u5_present > 0, round(u5_FM / u5_present, 2), NA_real_),
+      percent_care_Giver_Informed_SIA = ifelse(
+        Number_of_HH_visited > 0,
+        round((care_Giver_Informed_SIA / Number_of_HH_visited) * 100, 2),
+        NA_real_
+      )
+    ) %>%
+    group_by(Country, Region, District, Response, Vaccine.type, roundNumber) %>%
+    summarise(
+      start_date = min(start_date, na.rm = TRUE),
+      end_date = max(end_date, na.rm = TRUE),
+      Number_of_HH_visited = sum(Number_of_HH_visited, na.rm = TRUE),
+      u5_present = sum(u5_present, na.rm = TRUE),
+      u5_FM = sum(u5_FM, na.rm = TRUE),
+      missed_child = sum(missed_child, na.rm = TRUE),
+      
+      r_non_FM_Absent = sum(r_non_FM_Absent, na.rm = TRUE),
+      r_non_FM_NC = sum(r_non_FM_NC, na.rm = TRUE),
+      r_non_FM_hh_notvisited = sum(r_non_FM_hh_notvisited, na.rm = TRUE),
+      r_non_FM_hh_notrevisited = sum(r_non_FM_hh_notrevisited, na.rm = TRUE),
+      r_non_FM_sleep = sum(r_non_FM_sleep, na.rm = TRUE),
+      r_non_FM_vaccinatedRoutine = sum(r_non_FM_vaccinatedRoutine, na.rm = TRUE),
+      r_non_FM_other = sum(r_non_FM_other, na.rm = TRUE),
+      
+      care_Giver_Informed_SIA = sum(care_Giver_Informed_SIA, na.rm = TRUE),
+      
+      sm_info_tv = sum(sm_info_tv, na.rm = TRUE),
+      sm_info_radio = sum(sm_info_radio, na.rm = TRUE),
+      sm_info_others = sum(sm_info_others, na.rm = TRUE),
+      sm_info_hworker = sum(sm_info_hworker, na.rm = TRUE),
+      sm_info_mob_vanpa = sum(sm_info_mob_vanpa, na.rm = TRUE),
+      sm_info_town_crier = sum(sm_info_town_crier, na.rm = TRUE),
+      sm_info_volunteers = sum(sm_info_volunteers, na.rm = TRUE),
+      sm_info_com_infocentre = sum(sm_info_com_infocentre, na.rm = TRUE),
+      sm_info_community_leader = sum(sm_info_community_leader, na.rm = TRUE),
+      sm_info_religious_leader = sum(sm_info_religious_leader, na.rm = TRUE),
+      sm_info_mobile_social_media = sum(sm_info_mobile_social_media, na.rm = TRUE),
+      sm_info_mourchidate = sum(sm_info_mourchidate, na.rm = TRUE),
+      sm_info_mosque = sum(sm_info_mosque, na.rm = TRUE),
+      sm_info_vaccinators = sum(sm_info_vaccinators, na.rm = TRUE),
+      sm_info_h2h_mobilizer = sum(sm_info_h2h_mobilizer, na.rm = TRUE),
+      sm_info_sticker = sum(sm_info_sticker, na.rm = TRUE),
+      sm_info_newspaper_text = sum(sm_info_newspaper_text, na.rm = TRUE),
+      sm_info_teachers_student_text = sum(sm_info_teachers_student_text, na.rm = TRUE),
+      sm_info_iec_materials_text = sum(sm_info_iec_materials_text, na.rm = TRUE),
+      sm_total_sources = sum(sm_total_sources, na.rm = TRUE),
+      
+      r_abs_sick = sum(r_abs_sick, na.rm = TRUE),
+      r_abs_play_areas = sum(r_abs_play_areas, na.rm = TRUE),
+      r_abs_market = sum(r_abs_market, na.rm = TRUE),
+      r_abs_school = sum(r_abs_school, na.rm = TRUE),
+      r_abs_farm = sum(r_abs_farm, na.rm = TRUE),
+      r_abs_social_event = sum(r_abs_social_event, na.rm = TRUE),
+      r_abs_travelling = sum(r_abs_travelling, na.rm = TRUE),
+      r_abs_parent_absent = sum(r_abs_parent_absent, na.rm = TRUE),
+      r_abs_other_detail = sum(r_abs_other_detail, na.rm = TRUE),
+      
+      r_nc_religious_beliefs = sum(r_nc_religious_beliefs, na.rm = TRUE),
+      r_nc_side_effects = sum(r_nc_side_effects, na.rm = TRUE),
+      r_nc_too_many_doses = sum(r_nc_too_many_doses, na.rm = TRUE),
+      r_nc_child_sick = sum(r_nc_child_sick, na.rm = TRUE),
+      r_nc_covid = sum(r_nc_covid, na.rm = TRUE),
+      r_nc_other_detail = sum(r_nc_other_detail, na.rm = TRUE),
+      r_nc_not_decided = sum(r_nc_not_decided, na.rm = TRUE),
+      r_nc_polio_free = sum(r_nc_polio_free, na.rm = TRUE),
+      r_nc_nopv = sum(r_nc_nopv, na.rm = TRUE),
+      
+      abs_detail_total = sum(abs_detail_total, na.rm = TRUE),
+      nc_detail_total = sum(nc_detail_total, na.rm = TRUE),
+      reasons_total = sum(reasons_total, na.rm = TRUE),
+      unexplained_missed = sum(unexplained_missed, na.rm = TRUE),
+      overreported_reasons = sum(overreported_reasons, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      cv = ifelse(u5_present > 0, round(u5_FM / u5_present, 2), NA_real_),
+      year = year(start_date),
+      percent_care_Giver_Informed_SIA = ifelse(
+        Number_of_HH_visited > 0,
+        round((care_Giver_Informed_SIA / Number_of_HH_visited) * 100, 2),
+        NA_real_
+      ),
+      
+      check_missed = missed_child - reasons_total,
+      check_abs_detail = r_non_FM_Absent - abs_detail_total,
+      check_nc_detail = r_non_FM_NC - nc_detail_total,
+      check_sm_info = care_Giver_Informed_SIA - sm_total_sources,
+      sm_info_gap = pmax(check_sm_info, 0),
+      sm_info_overlap = pmax(-check_sm_info, 0),
+      
+      explained_ratio = ifelse(missed_child > 0, round(reasons_total / missed_child, 3), NA_real_),
+      unexplained_ratio = ifelse(missed_child > 0, round(unexplained_missed / missed_child, 3), NA_real_),
+      
+      reconciliation_flag = case_when(
+        check_missed == 0 ~ "Consistent",
+        check_missed > 0 & reasons_total == 0 ~ "No reasons recorded",
+        check_missed > 0 ~ "Partial reasons recorded",
+        check_missed < 0 ~ "Overlapping reasons",
+        TRUE ~ "Unknown"
+      ),
+      
+      abs_detail_flag = case_when(
+        check_abs_detail == 0 ~ "Abs detail consistent",
+        check_abs_detail > 0 ~ "Abs detail incomplete",
+        check_abs_detail < 0 ~ "Abs detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+      
+      nc_detail_flag = case_when(
+        check_nc_detail == 0 ~ "NC detail consistent",
+        check_nc_detail > 0 ~ "NC detail incomplete",
+        check_nc_detail < 0 ~ "NC detail overlapping",
+        TRUE ~ "Unknown"
+      ),
+      
+      sm_reconciliation_flag = case_when(
+        care_Giver_Informed_SIA > 0 & sm_total_sources == 0 ~ "No source recorded",
+        check_sm_info == 0 ~ "SM consistent",
+        check_sm_info < 0 ~ "Multiple sources per informed HH",
+        check_sm_info > 0 ~ "Some informed HH missing source",
+        TRUE ~ "Unknown"
+      ),
+      
+      qc_flag = case_when(
+        check_missed == 0 &
+          check_abs_detail == 0 &
+          check_nc_detail == 0 &
+          check_sm_info <= 0 ~ "OK",
+        TRUE ~ "Needs review"
+      )
+    ) %>%
+    filter(start_date > as_date("2019-10-01"))
+  
+  FI <- F5 %>%
+    left_join(
+      lookup_table,
+      by = c("Response", "Vaccine.type", "roundNumber"),
+      suffix = c("", "_lookup")
+    ) %>%
+    mutate(
+      start_date = coalesce(start_date_lookup, start_date),
+      end_date = coalesce(end_date_lookup, end_date),
+      round_start_date = coalesce(round_start_date, start_date - days(4))
+    ) %>%
+    select(-ends_with("_lookup")) %>%
+    filter(District != "NA")
+  
+  FE <- FI %>%
+    select(
+      country = Country,
+      province = Region,
+      district = District,
+      response = Response,
+      vaccine.type = Vaccine.type,
+      roundNumber,
+      round_start_date,
+      start_date_IM_end = start_date,
+      end_date_IM_end = end_date,
+      year,
+      Number_of_HH_visited,
+      u5_present,
+      u5_FM,
+      missed_child,
+      cv,
+      
+      r_non_FM_Absent,
+      r_non_FM_NC,
+      r_non_FM_hh_notvisited,
+      r_non_FM_hh_notrevisited,
+      r_non_FM_sleep,
+      r_non_FM_vaccinatedRoutine,
+      r_non_FM_other,
+      
+      care_Giver_Informed_SIA,
+      percent_care_Giver_Informed_SIA,
+      
+      sm_info_tv,
+      sm_info_radio,
+      sm_info_others,
+      sm_info_hworker,
+      sm_info_mob_vanpa,
+      sm_info_town_crier,
+      sm_info_volunteers,
+      sm_info_com_infocentre,
+      sm_info_community_leader,
+      sm_info_religious_leader,
+      sm_info_mobile_social_media,
+      sm_info_mourchidate,
+      sm_info_mosque,
+      sm_info_vaccinators,
+      sm_info_h2h_mobilizer,
+      sm_info_sticker,
+      sm_info_newspaper_text,
+      sm_info_teachers_student_text,
+      sm_info_iec_materials_text,
+      sm_total_sources,
+      sm_total_awareness_sources,
+
+      sm_traditional_leader,
+      sm_town_announcer,
+      sm_mosque_announcement,
+      sm_radio,
+      sm_newspaper,
+      sm_poster_leaflets,
+      sm_banner_hoarding,
+      sm_relative_neighbour_friend,
+      sm_health_worker,
+      sm_vcm_unicef,
+      sm_school_children_rally_visit,
+      sm_not_aware,
+      sm_other,
+
+      check_sm_info,
+      sm_info_gap,
+      sm_info_overlap,
+      sm_reconciliation_flag,
+      
+      r_abs_sick,
+      r_abs_play_areas,
+      r_abs_market,
+      r_abs_school,
+      r_abs_farm,
+      r_abs_social_event,
+      r_abs_travelling,
+      r_abs_parent_absent,
+      r_abs_other_detail,
+      
+      r_nc_religious_beliefs,
+      r_nc_side_effects,
+      r_nc_too_many_doses,
+      r_nc_child_sick,
+      r_nc_covid,
+      r_nc_other_detail,
+      r_nc_not_decided,
+      r_nc_polio_free,
+      r_nc_nopv,
+      
+      reasons_total,
+      abs_detail_total,
+      nc_detail_total,
+      check_missed,
+      check_abs_detail,
+      check_nc_detail,
+      unexplained_missed,
+      overreported_reasons,
+      explained_ratio,
+      unexplained_ratio,
+      reconciliation_flag,
+      abs_detail_flag,
+      nc_detail_flag,
+      qc_flag
+    ) %>%
+    arrange(start_date_IM_end)
+  
+  FE_QC <- FE %>%
+    filter(
+      qc_flag == "Needs review" |
+        abs(check_missed) >= 5 |
+        abs(check_abs_detail) >= 3 |
+        abs(check_nc_detail) >= 3 |
+        check_sm_info > 0
+    ) %>%
+    arrange(desc(abs(check_missed)), desc(abs(check_abs_detail)), desc(abs(check_nc_detail)), desc(check_sm_info))
+  
+  write_csv(FE, output_file)
+  write_csv(FE_QC, qc_output_file)
+  
+  message("Done: ", basename(input_file))
+  message("  Output: ", output_file)
+  message("  QC: ", qc_output_file)
+  
+  list(
+    data = FE,
+    qc = FE_QC,
+    summary = tibble(
+      file = basename(input_file),
+      rows_output = nrow(FE),
+      rows_qc = nrow(FE_QC),
+      countries = paste(unique(FE$country), collapse = ", "),
+      min_date = suppressWarnings(if (nrow(FE) > 0) min(FE$start_date_IM_end, na.rm = TRUE) else as.Date(NA)),
+      max_date = suppressWarnings(if (nrow(FE) > 0) max(FE$start_date_IM_end, na.rm = TRUE) else as.Date(NA))
+    )
+  )
+}
+
+# ============================================================
+# REGIONAL REPOSITORY BUILDER
+# ============================================================
+build_regional_im_repository <- function(processed_results, regional_repository_file, regional_qc_repository_file) {
+  message("\n============================================================")
+  message("Building Regional IM repository - harmonized with Nigeria builder")
+  message("============================================================")
+
+  clean_list <- lapply(processed_results, function(x) x$data)
+  qc_list <- lapply(processed_results, function(x) x$qc)
+
+  clean_list <- Filter(function(x) !is.null(x) && nrow(x) > 0, clean_list)
+  qc_list <- Filter(function(x) !is.null(x) && nrow(x) > 0, qc_list)
+
+  regional_im <- bind_rows_fill(clean_list)
+  regional_im_qc <- bind_rows_fill(qc_list)
+
+  regional_sm_vars <- c(
+    "sm_info_tv", "sm_info_radio", "sm_info_others", "sm_info_hworker",
+    "sm_info_mob_vanpa", "sm_info_town_crier", "sm_info_volunteers",
+    "sm_info_com_infocentre", "sm_info_community_leader",
+    "sm_info_religious_leader", "sm_info_mobile_social_media",
+    "sm_info_mourchidate", "sm_info_mosque", "sm_info_vaccinators",
+    "sm_info_h2h_mobilizer", "sm_info_sticker",
+    "sm_info_newspaper_text", "sm_info_teachers_student_text",
+    "sm_info_iec_materials_text"
+  )
+
+  nigeria_sm_vars <- c(
+    "sm_traditional_leader", "sm_town_announcer", "sm_mosque_announcement",
+    "sm_radio", "sm_newspaper", "sm_poster_leaflets", "sm_banner_hoarding",
+    "sm_relative_neighbour_friend", "sm_health_worker", "sm_vcm_unicef",
+    "sm_school_children_rally_visit", "sm_not_aware", "sm_other"
+  )
+
+  qc_vars <- c(
+    "reconciliation_flag", "abs_detail_flag", "nc_detail_flag",
+    "sm_reconciliation_flag", "qc_flag"
+  )
+
+  sm_indicator_vars <- c(
+    "sm_intensity_group", "sm_non_compliance_pressure",
+    "sm_gap_flag", "sm_priority_flag"
+  )
+
+  final_col_order <- c(
+    "country", "province", "district", "response", "vaccine.type",
+    "roundNumber", "round_start_date", "start_date_IM_end", "end_date_IM_end",
+    "year", "Number_of_HH_visited", "u5_present", "u5_FM", "missed_child", "cv",
+    "r_non_FM_Absent", "r_non_FM_NC", "r_non_FM_hh_notvisited",
+    "r_non_FM_hh_notrevisited", "r_non_FM_sleep",
+    "r_non_FM_vaccinatedRoutine", "r_non_FM_other",
+    "care_Giver_Informed_SIA", "percent_care_Giver_Informed_SIA",
+    regional_sm_vars, nigeria_sm_vars,
+    "sm_total_sources", "sm_total_awareness_sources",
+    "check_sm_info", "sm_info_gap", "sm_info_overlap",
+    "r_abs_sick", "r_abs_play_areas", "r_abs_market", "r_abs_school",
+    "r_abs_farm", "r_abs_social_event", "r_abs_travelling",
+    "r_abs_parent_absent", "r_abs_other_detail",
+    "r_nc_religious_beliefs", "r_nc_side_effects", "r_nc_too_many_doses",
+    "r_nc_child_sick", "r_nc_covid", "r_nc_other_detail",
+    "r_nc_not_decided", "r_nc_polio_free", "r_nc_nopv",
+    "reasons_total", "abs_detail_total", "nc_detail_total",
+    "check_missed", "check_abs_detail", "check_nc_detail",
+    "unexplained_missed", "overreported_reasons",
+    "explained_ratio", "unexplained_ratio",
+    qc_vars, sm_indicator_vars
+  )
+
+  make_empty_repo <- function() {
+    out <- tibble()
+    for (cc in final_col_order) out[[cc]] <- character()
+    out$round_start_date <- as.Date(out$round_start_date)
+    out$start_date_IM_end <- as.Date(out$start_date_IM_end)
+    out$end_date_IM_end <- as.Date(out$end_date_IM_end)
+    out
+  }
+
+  ensure_harmonized_schema <- function(df) {
+    if (is.null(df) || nrow(df) == 0) return(make_empty_repo())
+
+    numeric_cols <- c(
+      "year", "Number_of_HH_visited", "u5_present", "u5_FM", "missed_child", "cv",
+      "r_non_FM_Absent", "r_non_FM_NC", "r_non_FM_hh_notvisited",
+      "r_non_FM_hh_notrevisited", "r_non_FM_sleep",
+      "r_non_FM_vaccinatedRoutine", "r_non_FM_other",
+      "care_Giver_Informed_SIA", "percent_care_Giver_Informed_SIA",
+      regional_sm_vars, nigeria_sm_vars,
+      "sm_total_sources", "sm_total_awareness_sources",
+      "check_sm_info", "sm_info_gap", "sm_info_overlap",
+      "r_abs_sick", "r_abs_play_areas", "r_abs_market", "r_abs_school",
+      "r_abs_farm", "r_abs_social_event", "r_abs_travelling",
+      "r_abs_parent_absent", "r_abs_other_detail",
+      "r_nc_religious_beliefs", "r_nc_side_effects", "r_nc_too_many_doses",
+      "r_nc_child_sick", "r_nc_covid", "r_nc_other_detail",
+      "r_nc_not_decided", "r_nc_polio_free", "r_nc_nopv",
+      "reasons_total", "abs_detail_total", "nc_detail_total",
+      "check_missed", "check_abs_detail", "check_nc_detail",
+      "unexplained_missed", "overreported_reasons",
+      "explained_ratio", "unexplained_ratio"
+    )
+
+    date_cols <- c("round_start_date", "start_date_IM_end", "end_date_IM_end")
+    character_cols <- setdiff(final_col_order, c(numeric_cols, date_cols))
+
+    for (cc in numeric_cols) {
+      if (!cc %in% names(df)) df[[cc]] <- 0
+      df[[cc]] <- suppressWarnings(as.numeric(df[[cc]]))
+      df[[cc]][is.na(df[[cc]])] <- 0
+    }
+
+    for (cc in date_cols) {
+      if (!cc %in% names(df)) df[[cc]] <- as.Date(NA)
+      df[[cc]] <- suppressWarnings(as.Date(df[[cc]]))
+    }
+
+    for (cc in character_cols) {
+      if (!cc %in% names(df)) df[[cc]] <- NA_character_
+      df[[cc]] <- as.character(df[[cc]])
+    }
+
+    technical_sm_source <- df$sm_info_hworker + df$sm_info_vaccinators + df$sm_health_worker + df$sm_vcm_unicef
+
+    df <- df %>%
+      mutate(
+        sm_total_awareness_sources = pmax(sm_total_sources - sm_not_aware, 0),
+        sm_intensity_group = case_when(
+          sm_total_awareness_sources == 0 ~ "No awareness source",
+          sm_total_awareness_sources == 1 ~ "One awareness source",
+          sm_total_awareness_sources <= 3 ~ "2-3 awareness sources",
+          sm_total_awareness_sources >= 4 ~ "4+ awareness sources",
+          TRUE ~ "Unknown"
+        ),
+        sm_non_compliance_pressure = case_when(
+          sm_total_awareness_sources == 0 & r_non_FM_NC > 0 ~ "Non-compliance with no awareness source",
+          sm_total_awareness_sources > 0 & r_non_FM_NC > 0 ~ "Non-compliance despite awareness",
+          sm_total_awareness_sources > 0 & r_non_FM_NC == 0 ~ "Awareness with no non-compliance",
+          TRUE ~ "No SM / no non-compliance"
+        ),
+        sm_gap_flag = case_when(
+          sm_total_awareness_sources == 0 ~ "SM gap detected",
+          TRUE ~ "SM source recorded"
+        ),
+        sm_priority_flag = case_when(
+          sm_total_awareness_sources == 0 & !is.na(cv) & cv < 0.9 ~ "High priority SM gap",
+          r_non_FM_NC > 0 & technical_sm_source == 0 ~ "Community resistance / weak technical source",
+          sm_not_aware > 0 ~ "Not aware reported",
+          TRUE ~ "No major SM alert"
+        )
+      )
+
+    existing_final_cols <- intersect(final_col_order, names(df))
+    remaining_cols <- setdiff(names(df), existing_final_cols)
+    df[, c(existing_final_cols, remaining_cols), drop = FALSE]
+  }
+
+  regional_im <- ensure_harmonized_schema(regional_im)
+  regional_im_qc <- ensure_harmonized_schema(regional_im_qc)
+
+  if (all(c("country", "province", "district", "start_date_IM_end") %in% names(regional_im))) {
+    regional_im <- regional_im %>%
+      arrange(country, province, district, start_date_IM_end)
+  }
+
+  if (all(c("check_missed", "check_abs_detail", "check_nc_detail", "check_sm_info") %in% names(regional_im_qc))) {
+    regional_im_qc <- regional_im_qc %>%
+      arrange(
+        desc(abs(check_missed)),
+        desc(abs(check_abs_detail)),
+        desc(abs(check_nc_detail)),
+        desc(check_sm_info)
+      )
+  }
+
+  write_csv(regional_im, regional_repository_file)
+  write_csv(regional_im_qc, regional_qc_repository_file)
+
+  message("\nRegional IM repository saved to: ", regional_repository_file)
+  message("Regional IM QC repository saved to: ", regional_qc_repository_file)
+  message("Rows in Regional IM repository: ", nrow(regional_im))
+  message("Rows in Regional QC repository: ", nrow(regional_im_qc))
+
+  if ("sm_intensity_group" %in% names(regional_im)) {
+    message("\nSM intensity summary:")
+    print(regional_im %>% count(sm_intensity_group, sort = TRUE))
+  }
+
+  if ("sm_priority_flag" %in% names(regional_im)) {
+    message("\nSM priority summary:")
+    print(regional_im %>% count(sm_priority_flag, sort = TRUE))
+  }
+
+  list(
+    regional_im = regional_im,
+    regional_im_qc = regional_im_qc
+  )
+}
+
+# ============================================================
+# BATCH RUNNER
+# ============================================================
+process_all_im_files <- function(input_folder, output_folder, qc_output_folder, lookup_table) {
+  files <- list.files(
+    input_folder,
+    pattern = "\\.(rds|qs|csv|xlsx|xls|parquet)$",
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  
+  if (length(files) == 0) {
+    stop("No supported files found in: ", input_folder)
+  }
+  
+  bad_patterns <- c(
+    "fetch_log",
+    "processing_summary",
+    "regional_im_repository",
+    "_qc",
+    "^qc$",
+    "repository"
+  )
+  
+  keep_file <- function(f) {
+    b <- tolower(basename(f))
+    !any(stringr::str_detect(b, regex(paste(bad_patterns, collapse = "|"), ignore_case = TRUE)))
+  }
+  
+  files <- files[vapply(files, keep_file, logical(1))]
+  
+  if (length(files) == 0) {
+    stop("No valid IM input files found after excluding logs/repository files in: ", input_folder)
+  }
+  
+  message("Found ", length(files), " files to process.")
+  
+  processed_results <- list()
+  summary_results <- list()
+  
+  for (f in files) {
+    res <- tryCatch(
+      process_im_file(f, output_folder, qc_output_folder, lookup_table),
+      error = function(e) {
+        message("ERROR in file ", basename(f), ": ", e$message)
+        list(
+          data = NULL,
+          qc = NULL,
+          summary = tibble(
+            file = basename(f),
+            rows_output = NA_integer_,
+            rows_qc = NA_integer_,
+            countries = NA_character_,
+            min_date = as.Date(NA),
+            max_date = as.Date(NA)
+          )
+        )
+      }
+    )
+    
+    processed_results[[basename(f)]] <- res
+    summary_results[[basename(f)]] <- res$summary
+  }
+  
+  list(
+    processed_results = processed_results,
+    summary_table = bind_rows(summary_results)
+  )
+}
+
+# ============================================================
+# RUN FULL PIPELINE
+# ============================================================
+batch_run <- process_all_im_files(
+  input_folder = input_folder,
+  output_folder = output_folder,
+  qc_output_folder = qc_output_folder,
+  lookup_table = lookup_table
+)
+
+summary_table <- batch_run$summary_table
+processed_results <- batch_run$processed_results
+
+write_csv(summary_table, summary_file)
+
+message("Successful files with non-null data: ",
+        sum(vapply(processed_results, function(x) !is.null(x$data), logical(1))))
+message("Successful files with non-null qc: ",
+        sum(vapply(processed_results, function(x) !is.null(x$qc), logical(1))))
+
+regional_repo <- build_regional_im_repository(
+  processed_results = processed_results,
+  regional_repository_file = regional_repository_file,
+  regional_qc_repository_file = regional_qc_repository_file
+)
+
+print(summary_table)
+
+message("\nBatch processing completed.")
+message("Summary file: ", summary_file)
+message("Regional repository rows: ", nrow(regional_repo$regional_im))
+message("Regional QC rows: ", nrow(regional_repo$regional_im_qc))
+
+
+
+
+

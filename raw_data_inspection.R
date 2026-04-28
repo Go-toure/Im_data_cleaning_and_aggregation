@@ -2,20 +2,22 @@ library(data.table)
 library(stringr)
 library(qs)
 
-# setwd("C:/Users/TOURE/Mes documents/REPOSITORIES/IM_raw_data/IM_raw/") 6427  8587
-setwd("C:/Users/TOURE/Documents/PADACORD/LQAS/")
+# setwd("C:/Users/TOURE/Mes documents/REPOSITORIES/IM_raw_data/IM_raw/") #6427  8587
+# setwd("C:/Users/TOURE/Documents/PADACORD/LQAS/")
+
+rds_file <- "C:/Users/TOURE/Documents/PADACORD/IM/7178.rds"
 
 # data <- read_csv(input_file, show_col_types = FALSE)
 # rds_file <- "C:/Users/TOURE/Documents/PADACORD/IM/7178.rds"
 
-input_file  <- "4500.rds" 
+# input_file  <-  "7178.rds" #"4500.rds" 
 # input_folder <- "C:/Users/TOURE/Documents/PADACORD/IM/"
 # ============================================================
 # Read raw data
 # ============================================================
-data <- qread(input_file)
+# data <- qread(input_file)
 
-
+data <- qread(rds_file)
 # file.info(rds_file)$size
 
 # data <- qread(rds_file)
