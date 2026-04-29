@@ -1038,13 +1038,11 @@ process_final_data <- function(df) {
 # Fixes missing sm_not_aware issue in Regional files
 # ============================================================
 add_sm_intelligence_indicators <- function(df) {
-  if (is.null(df) || nrow(df) == 0) return(df)
-
+  
   needed_numeric <- c(
     "sm_total_sources",
     "sm_total_awareness_sources",
     "sm_not_aware",
-    "r_non_compliance",
     "r_non_FM_NC",
     "cv",
     "sm_info_hworker",
@@ -1052,30 +1050,21 @@ add_sm_intelligence_indicators <- function(df) {
     "sm_health_worker",
     "sm_vcm_unicef"
   )
-
+  
   for (cc in needed_numeric) {
     if (!cc %in% names(df)) df[[cc]] <- 0
     df[[cc]] <- suppressWarnings(as.numeric(df[[cc]]))
     df[[cc]][is.na(df[[cc]])] <- 0
   }
-
-  df <- df %>%
-    mutate(
-      sm_total_awareness_sources = pmax(0, sm_total_sources - sm_not_aware),
-      r_non_compliance = dplyr::coalesce(r_non_compliance, r_non_FM_NC, 0)
-    )
-
-  technical_cols <- intersect(
-    c("sm_info_hworker", "sm_info_vaccinators", "sm_health_worker", "sm_vcm_unicef"),
-    names(df)
+  
+  technical_sm_source <- rowSums(
+    df[, intersect(
+      c("sm_info_hworker", "sm_info_vaccinators", "sm_health_worker", "sm_vcm_unicef"),
+      names(df)
+    ), drop = FALSE],
+    na.rm = TRUE
   )
-
-  technical_sm_source <- if (length(technical_cols) > 0) {
-    safe_row_sum(df, technical_cols)
-  } else {
-    rep(0, nrow(df))
-  }
-
+  
   df %>%
     mutate(
       sm_intensity_group = case_when(
@@ -1085,24 +1074,28 @@ add_sm_intelligence_indicators <- function(df) {
         sm_total_awareness_sources >= 4 ~ "4+ awareness sources",
         TRUE ~ "Unknown"
       ),
+      
       sm_non_compliance_pressure = case_when(
-        sm_total_awareness_sources == 0 & r_non_compliance > 0 ~ "Non-compliance with no awareness source",
-        sm_total_awareness_sources > 0 & r_non_compliance > 0 ~ "Non-compliance despite awareness",
-        sm_total_awareness_sources > 0 & r_non_compliance == 0 ~ "Awareness with no non-compliance",
+        sm_total_awareness_sources == 0 & r_non_FM_NC > 0 ~ "Non-compliance with no awareness source",
+        sm_total_awareness_sources > 0 & r_non_FM_NC > 0 ~ "Non-compliance despite awareness",
+        sm_total_awareness_sources > 0 & r_non_FM_NC == 0 ~ "Awareness with no non-compliance",
         TRUE ~ "No SM / no non-compliance"
       ),
+      
       sm_gap_flag = case_when(
         sm_total_awareness_sources == 0 ~ "SM gap detected",
         TRUE ~ "SM source recorded"
       ),
+      
       sm_priority_flag = case_when(
         sm_total_awareness_sources == 0 & cv < 0.9 ~ "High priority SM gap",
-        r_non_compliance > 0 & technical_sm_source == 0 ~ "Community resistance / weak technical source",
+        r_non_FM_NC > 0 & technical_sm_source == 0 ~ "Community resistance / weak technical source",
         sm_not_aware > 0 ~ "Not aware reported",
         TRUE ~ "No major SM alert"
       )
     )
 }
+
 
 # MAIN FILE PROCESSOR
 # ============================================================
